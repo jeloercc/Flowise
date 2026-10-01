@@ -1,0 +1,19 @@
+# .bobignore: same syntax as .gitignore.
+# Zero-Context, applied to Bob itself: Bob never sees our secrets.
+.env
+.env.*
+!.env.example
+**/encryption.key
+*.sqlite
+*.sqlite3
+*.db
+.flowise/
+
+# Noise that burns Bobcoins without adding understanding.
+node_modules/
+**/dist/
+**/build/
+.turbo/
+pnpm-lock.yaml
+**/*.map
+**/*.min.js

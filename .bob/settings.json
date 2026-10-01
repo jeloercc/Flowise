@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh .bob/hooks/session-context.sh", "timeout": 5 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh .bob/hooks/log-event.sh prompt", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh .bob/hooks/log-event.sh stop", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
