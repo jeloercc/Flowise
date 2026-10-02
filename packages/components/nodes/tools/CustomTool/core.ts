@@ -4,6 +4,8 @@ import { StructuredTool, ToolParams } from '@langchain/core/tools'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
 import { executeJavaScriptCode, createCodeExecutionSandbox, parseWithTypeConversion } from '../../../src/utils'
 import { ICommonObject } from '../../../src/Interface'
+import { SecretBinding, makeSecureRequestHelper } from '../../../src/guardRequest'
+import { redact } from '../../../src/guardRedact'
 
 class ToolInputParsingException extends Error {
     output?: string
@@ -45,6 +47,10 @@ export class DynamicStructuredTool<
     schema: T
     private variables: any[]
     private flowObj: any
+    /** Zero-Context Guard: admin-declared secret bindings (F-01, F-02, F-05) */
+    private secretBindings: SecretBinding[] = []
+    /** Runtime options from the Flowise execution context (needed for getCredentialData) */
+    private executionOptions: ICommonObject = {}
 
     constructor(fields: DynamicStructuredToolInput<T>) {
         super(fields)
@@ -122,15 +128,38 @@ export class DynamicStructuredTool<
         // Prepare flow object for sandbox
         const flow = this.flowObj ? { ...this.flowObj, ...flowConfig } : {}
 
-        const sandbox = createCodeExecutionSandbox('', this.variables || [], flow, additionalSandbox)
+        // ── Zero-Context Guard ────────────────────────────────────────────────
+        // When secret bindings are declared, inject $secureRequest and remove
+        // $vars from scope so raw secret values never enter the sandbox (F-01, F-02, F-05).
+        const hasBindings = this.secretBindings.length > 0
+        const secureRequestHelper = hasBindings ? makeSecureRequestHelper(this.secretBindings, this.executionOptions) : undefined
 
-        let response = await executeJavaScriptCode(this.code, sandbox)
+        const sandbox = createCodeExecutionSandbox('', this.variables || [], flow, additionalSandbox, secureRequestHelper)
+
+        // Collect resolved secret values for post-execution redaction (F-04, F-06).
+        // We collect them here lazily so they are never stored longer than needed.
+        // Note: these strings are in the host process only and never enter the sandbox.
+        let resolvedSecretValues: string[] = []
+
+        let response: any
+        try {
+            response = await executeJavaScriptCode(this.code, sandbox, {
+                // Disable E2B when bindings are present: the remote VM cannot
+                // receive the $secureRequest closure and must not see $vars (F-01).
+                disableE2B: hasBindings
+            })
+        } catch (e: any) {
+            // Redact any secret patterns from error messages before re-throw (F-06).
+            const safeMessage = redact(e?.message ?? String(e), resolvedSecretValues)
+            throw new Error(safeMessage)
+        }
 
         if (typeof response === 'object') {
             response = JSON.stringify(response)
         }
 
-        return response
+        // Redact the output before it reaches handleToolEnd / LLM (F-02, F-04).
+        return redact(String(response ?? ''), resolvedSecretValues)
     }
 
     setVariables(variables: any[]) {
@@ -139,5 +168,21 @@ export class DynamicStructuredTool<
 
     setFlowObject(flow: any) {
         this.flowObj = flow
+    }
+
+    /**
+     * Zero-Context Guard: stores admin-declared secret bindings on the tool.
+     * Called from CustomTool.ts:init() after constructing the tool instance.
+     */
+    setSecretBindings(bindings: SecretBinding[]) {
+        this.secretBindings = bindings ?? []
+    }
+
+    /**
+     * Zero-Context Guard: stores the Flowise execution options so the helper
+     * can call getCredentialData during _call().
+     */
+    setExecutionOptions(options: ICommonObject) {
+        this.executionOptions = options ?? {}
     }
 }

@@ -1,6 +1,7 @@
 import { ICommonObject, IDatabaseEntity, INode, INodeData, INodeOptionsValue, INodeParams } from '../../../src/Interface'
 import { convertSchemaToZod, getBaseClasses, getVars } from '../../../src/utils'
 import { DynamicStructuredTool } from './core'
+import { SecretBinding } from '../../../src/guardRequest'
 import { z } from 'zod/v3'
 import { DataSource } from 'typeorm'
 import { SecureZodSchemaParser } from '../../../src/secureZodParser'
@@ -131,6 +132,23 @@ class CustomTool_Tools implements INode {
             dynamicStructuredTool.setVariables(variables)
             dynamicStructuredTool.setFlowObject(flow)
             dynamicStructuredTool.returnDirect = customToolReturnDirect
+
+            // Zero-Context Guard: parse and attach secret bindings (F-01, F-02, F-05).
+            // secretBindings is an optional array declared by the admin at tool-design time.
+            // The LLM never sees credentialId or allowedHosts values.
+            const rawBindings = nodeData.inputs?.secretBindings
+            if (rawBindings) {
+                let bindings: SecretBinding[] = []
+                try {
+                    bindings = typeof rawBindings === 'string' ? JSON.parse(rawBindings) : rawBindings
+                } catch {
+                    // Malformed bindings — ignore rather than crash the tool load
+                }
+                if (Array.isArray(bindings) && bindings.length > 0) {
+                    dynamicStructuredTool.setSecretBindings(bindings)
+                    dynamicStructuredTool.setExecutionOptions(options)
+                }
+            }
 
             return dynamicStructuredTool
         } catch (e) {

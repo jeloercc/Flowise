@@ -1013,6 +1013,30 @@ export const getVars = async (
  * Prepare sandbox variables
  * @param {IVariable[]} variables
  */
+
+/**
+ * Zero-Context Guard: env-key names that are blocked from becoming runtime
+ * sandbox variables.  Any IVariable with type === 'runtime' whose name
+ * matches one of these patterns is silently skipped so that sensitive keys
+ * (encryption keys, API tokens, etc.) from process.env can never enter $vars.
+ */
+export const BLOCKED_ENV_KEY_PATTERNS = [
+    /SECRET/i,
+    /\bKEY\b/i,
+    /TOKEN/i,
+    /PASSWORD/i,
+    /PASSWD/i,
+    /CREDENTIAL/i,
+    /APIKEY/i,
+    /API_KEY/i,
+    /ACCESS_KEY/i,
+    /PRIVATE/i,
+    /ENCRYPTION/i,
+    /\bJWT\b/i,
+    /\bCERT\b/i,
+    /FLOWISE_/i
+]
+
 export const prepareSandboxVars = (variables: IVariable[]) => {
     let vars = {}
     if (variables) {
@@ -1021,6 +1045,16 @@ export const prepareSandboxVars = (variables: IVariable[]) => {
 
             // read from .env file
             if (item.type === 'runtime') {
+                // Zero-Context Guard: block sensitive env-key names (F-03)
+                const isBlocked = BLOCKED_ENV_KEY_PATTERNS.some((re) => re.test(item.name))
+                if (isBlocked) {
+                    console.warn(
+                        `[ZeroContextGuard] Skipping runtime variable "${item.name}": ` +
+                            `name matches a blocked pattern. Remove FLOWISE_ / SECRET / KEY / TOKEN / PASSWORD ` +
+                            `names from runtime variables to silence this warning.`
+                    )
+                    continue
+                }
                 value = process.env[item.name] ?? ''
             }
 
@@ -1597,13 +1631,20 @@ export const executeJavaScriptCode = async (
     options: {
         timeout?: number
         useSandbox?: boolean
+        /**
+         * Zero-Context Guard: set to true when the tool has secret bindings
+         * so that the E2B remote sandbox is bypassed (F-01, F-05).
+         * The NodeVM path is used instead; $secureRequest is available in the
+         * sandbox but raw $vars values are not.
+         */
+        disableE2B?: boolean
         libraries?: string[]
         streamOutput?: (output: string) => void
         nodeVMOptions?: ICommonObject
     } = {}
 ): Promise<any> => {
-    const { timeout = 300000, useSandbox = true, streamOutput, libraries = [], nodeVMOptions = {} } = options
-    const shouldUseE2BSandbox = useSandbox && process.env.E2B_APIKEY
+    const { timeout = 300000, useSandbox = true, disableE2B = false, streamOutput, libraries = [], nodeVMOptions = {} } = options
+    const shouldUseE2BSandbox = useSandbox && !disableE2B && process.env.E2B_APIKEY
 
     let timeoutMs = timeout
     if (process.env.SANDBOX_TIMEOUT) {
@@ -1823,7 +1864,13 @@ export const createCodeExecutionSandbox = (
     input: string,
     variables: IVariable[],
     flow: ICommonObject,
-    additionalSandbox: ICommonObject = {}
+    additionalSandbox: ICommonObject = {},
+    /**
+     * Zero-Context Guard: when provided, `$secureRequest` is injected into
+     * the sandbox and `$vars` is removed to prevent raw secret exposure.
+     * When undefined the sandbox behaves exactly as before (backward compat).
+     */
+    secureRequestHelper?: ((...args: any[]) => Promise<string>) | undefined
 ): ICommonObject => {
     const sandbox: ICommonObject = {
         $input: input,
@@ -1835,7 +1882,13 @@ export const createCodeExecutionSandbox = (
         ...additionalSandbox
     }
 
-    sandbox['$vars'] = prepareSandboxVars(variables)
+    if (secureRequestHelper) {
+        // Zero-Context Guard active: inject helper, suppress $vars (F-01, F-02)
+        sandbox['$secureRequest'] = secureRequestHelper
+    } else {
+        // Legacy path: $vars remains in scope for backward compatibility
+        sandbox['$vars'] = prepareSandboxVars(variables)
+    }
     sandbox['$flow'] = flow
 
     return sandbox

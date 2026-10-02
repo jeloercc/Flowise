@@ -1,4 +1,5 @@
 import { Logger } from 'winston'
+import { redact } from './guardRedact'
 import { URL } from 'url'
 import { v4 as uuidv4 } from 'uuid'
 import { Client } from 'langsmith'
@@ -311,19 +312,18 @@ export class ConsoleCallbackHandler extends BaseTracer {
 
     onToolEnd(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
-        this.logger.verbose(
-            `[${this.orgId}]: [tool/end] [${crumbs}] [${elapsed(run)}] Exiting Tool run with output: "${run.outputs?.output?.trim()}"`
-        )
+        // Zero-Context Guard: redact before logging to prevent $vars leaking into
+        // server logs / SIEM (F-08).
+        const safeOutput = redact(run.outputs?.output?.trim() ?? '', [])
+        this.logger.verbose(`[${this.orgId}]: [tool/end] [${crumbs}] [${elapsed(run)}] Exiting Tool run with output: "${safeOutput}"`)
     }
 
     onToolError(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
-        this.logger.verbose(
-            `[${this.orgId}]: [tool/error] [${crumbs}] [${elapsed(run)}] Tool run errored with error: ${tryJsonStringify(
-                run.error,
-                '[error]'
-            )}`
-        )
+        // Zero-Context Guard: redact error before logging (F-08).
+        const safeError = tryJsonStringify(run.error, '[error]')
+        const safeRedacted = redact(safeError, [])
+        this.logger.verbose(`[${this.orgId}]: [tool/error] [${crumbs}] [${elapsed(run)}] Tool run errored with error: ${safeRedacted}`)
     }
 
     onAgentAction(run: Run) {
@@ -2006,7 +2006,10 @@ export class CustomStreamingHandler extends BaseCallbackHandler {
     async handleToolEnd(output: string | object, runId: string, parentRunId?: string): Promise<void> {
         if (!this.sseStreamer) return
 
-        const toolOutput = typeof output === 'string' ? output : JSON.stringify(output, null, 2)
+        const rawOutput = typeof output === 'string' ? output : JSON.stringify(output, null, 2)
+        // Zero-Context Guard: redact before emitting over SSE / to tracing
+        // providers that share the same callback chain (F-04, F-10).
+        const toolOutput = redact(rawOutput, [])
 
         // Stream the tool output details using the agent_trace event type for consistency
         this.sseStreamer.streamCustomEvent(this.chatId, 'agent_trace', {
@@ -2023,10 +2026,13 @@ export class CustomStreamingHandler extends BaseCallbackHandler {
     async handleToolError(error: Error, runId: string, parentRunId?: string): Promise<void> {
         if (!this.sseStreamer) return
 
+        // Zero-Context Guard: redact error message before emitting over SSE (F-06).
+        const safeMessage = redact(error.message ?? '', [])
+
         // Stream the tool error details using the agent_trace event type for consistency
         this.sseStreamer.streamCustomEvent(this.chatId, 'agent_trace', {
             step: 'tool_error',
-            error: error.message,
+            error: safeMessage,
             runId,
             parentRunId: parentRunId || null
         })
