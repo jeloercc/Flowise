@@ -1,6 +1,6 @@
 # Flowise Fork — Baseline
 
-Recorded on branch `zero-context-guard`. No source code was modified.
+Recorded on branch `zero-context-guard`.
 
 ## Environment
 
@@ -26,8 +26,11 @@ pnpm install
 NODE_OPTIONS=--max-old-space-size=4096 pnpm build
 # 6 packages built via turbo; all cached on second run
 
-# 4. Run component tests
+# 4. Run component tests (pre-Guard baseline, no source changes)
 pnpm --filter flowise-components test -- --forceExit --testTimeout=60000
+
+# 5. Run component tests (post-Guard, after commit 8c485a9d)
+pnpm --filter flowise-components exec jest --ci --forceExit --silent
 ```
 
 ## Build result
@@ -40,6 +43,8 @@ Build ran with `NODE_OPTIONS=--max-old-space-size=4096` as a precaution (first r
 
 ## Test results (`flowise-components`)
 
+### Pre-Guard snapshot (unmodified upstream, 2025-07-30)
+
 | Metric        | Count  |
 | ------------- | ------ |
 | Test suites   | 20     |
@@ -48,11 +53,23 @@ Build ran with `NODE_OPTIONS=--max-old-space-size=4096` as a precaution (first r
 | Tests skipped | 0      |
 | Duration      | ~299 s |
 
-Jest printed a "worker process has failed to exit gracefully" warning and was force-exited. This is caused by a leaked async timer (open handles in some test node integration), **not** a test failure. All 910 assertions passed.
+### Post-Guard snapshot (after commit `8c485a9d`, 2025-07-30)
+
+Command: `pnpm --filter flowise-components exec jest --ci --forceExit --silent`
+
+| Metric        | Count  | Delta vs pre-Guard             |
+| ------------- | ------ | ------------------------------ |
+| Test suites   | 22     | +2 (guardRedact, guardRequest) |
+| Tests passed  | 943    | +33 new guard tests            |
+| Tests failed  | 0      | —                              |
+| Tests skipped | 0      | —                              |
+| Duration      | ~108 s | —                              |
+
+Jest printed a "worker process has failed to exit gracefully" warning and was force-exited in both snapshots. This is a pre-existing leaked async timer in some integration tests, **not** a test failure.
 
 ## Failing tests (pre-existing)
 
-**None.** All 910 tests pass on the unmodified upstream codebase.
+**None.** Zero failures in both the pre-Guard and post-Guard runs.
 
 ## Notable warnings (non-blocking)
 
