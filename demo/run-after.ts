@@ -297,21 +297,20 @@ async function main() {
 
     // ─────────────────────────────────────────────────────────────────────────
     // Defence 3a: same-hostname / different-port redirect also strips Authorization
-    //   This EXACTLY replays the attack from before.sh:
-    //     127.0.0.1:4001 → 127.0.0.1:4002
+    //   SAME REQUEST as before.sh Attack 2: 127.0.0.1:4001 → 127.0.0.1:4002
     //   originOrigin = "http://127.0.0.1:4001"; redirectOrigin = "http://127.0.0.1:4002"
     //   port changes → different origin → Authorization stripped
     //
-    //   Before this fix: only hostname was compared → Authorization was forwarded.
+    //   Upstream code forwarded the header (no stripping logic).
+    //   Our fix uses origin-based comparison — port change is caught.
     // ─────────────────────────────────────────────────────────────────────────
-    subheader('Defence 3a — same-hostname/different-port redirect also strips Authorization')
-    console.log('  (This is the attack replayed from before.sh: 127.0.0.1:4001 → 127.0.0.1:4002)')
+    subheader('Defence 3a — same-hostname/different-port redirect strips Authorization')
+    console.log('  (Same request as before.sh Attack 2: 127.0.0.1:4001 → 127.0.0.1:4002)')
+    console.log('  Upstream code forwarded Authorization; our origin-based check strips it.')
 
     Object.keys(receivedByB).forEach((k) => delete receivedByB[k])
 
-    // Server A on 4001 redirects to server B on 4002 (reusing srvB3 on 4005 is not possible
-    // because we need 4002 for the exact before.sh attack; srvAttacker from D2b is on 4002
-    // but already closed — reuse it by creating a new one on 4002).
+    // Exact same topology as before.sh: server A on :4001 redirects to server B on :4002
     const srvB3a = createServer((req, res) => {
         Object.assign(receivedByB, req.headers)
         res.writeHead(200)

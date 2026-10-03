@@ -174,17 +174,23 @@ with real TCP servers ([`httpSecurity.pinnedAgent.test.ts`](../packages/componen
 No server, no credentials, no setup — just Node ≥ 20 and a cloned repo.
 
 ```bash
-# Show the unguarded attack: $vars exfiltration + Authorization forwarded on redirect
+# Show attacks using ORIGINAL upstream Flowise code (commit 9291856d):
+#   Attack 1: $vars exfiltration — LLM receives all workspace secrets
+#   Attack 2: Authorization header forwarded on same-hostname/different-port redirect
+#             (upstream has NO cross-origin header-stripping logic)
 bash demo/before.sh
 # Expected: runs in < 40 s; prints ⚠️ for each demonstrated leak; exits 0
 
-# Show all four defences live against real TCP servers
+# Show all defences live against real TCP servers (our fixed code)
 bash demo/after.sh
 # Expected: runs in < 40 s; prints ✅ for each defence; exits 0
-#   Defence 1: $vars absent; resolved values redacted from output
+#   Defence 1:  $vars absent; resolved values redacted from output
 #   Defence 2a: allowedHosts blocks initial call to non-allowed host
 #   Defence 2b: live redirect (localhost:4001 → 127.0.0.1:4002) blocked at hop 1
-#   Defence 3: cross-host redirect strips Authorization; same-host keeps it
+#   Defence 3:  cross-host redirect strips Authorization
+#   Defence 3a: same-hostname/different-port redirect strips Authorization
+#               (same request as before.sh Attack 2 — now fixed by origin-based check)
+#   Defence 3b: same-origin redirect keeps Authorization (precision)
 ```
 
 Both scripts set `HTTP_SECURITY_CHECK=false` internally (loopback allowed inside the demo
@@ -253,7 +259,7 @@ Bob implemented the guard test-first, in sequential subtasks:
 
 6. Modified [`httpSecurity.ts`](../packages/components/src/httpSecurity.ts): added `secureAxiosSingleHop` (DNS-pinning closes TOCTOU window), cross-host redirect header stripping, and the `createPinnedAgent` `opts.all` fix. Added 9 tests to [`httpSecurity.test.ts`](../packages/components/src/httpSecurity.test.ts) and 4 integration tests in [`httpSecurity.pinnedAgent.test.ts`](../packages/components/src/httpSecurity.pinnedAgent.test.ts).
 
-7. Ran full suite: **974 tests, 0 failures, 24 suites** (baseline: 910 / 20 suites). Pre-commit hooks (prettier, eslint, lint-staged) passed automatically.
+7. Ran full suite: **981 tests, 0 failures, 24 suites** (baseline: 910 / 20 suites). Pre-commit hooks (prettier, eslint, lint-staged) passed automatically.
 
 ### Measurable Bob contribution
 
@@ -304,7 +310,7 @@ demo/
 ```bash
 pnpm install
 pnpm --filter flowise-components exec jest --ci --forceExit --silent
-# Expected: Test Suites: 24 passed, Tests: 974 passed, 0 failed
+# Expected: Test Suites: 24 passed, Tests: 981 passed, 0 failed
 # Baseline (before guard): 910 tests / 20 suites
 # New guard tests: guardRequest=25, guardRedact=20, core=6, httpSecurity=9, pinnedAgent=4 → +64
 ```

