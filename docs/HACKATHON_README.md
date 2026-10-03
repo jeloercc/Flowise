@@ -2,15 +2,14 @@
 
 ## 1. Project Description (100-word submission field)
 
-> Flowise is end-of-life and ships with a critical class of vulnerabilities: every Custom
-> Tool executed by an LLM receives raw `$vars` — workspace secrets, API keys, and
-> environment variables — in plain text inside the sandbox. One prompt injection is all an
-> attacker needs to exfiltrate them. We modernized this with a **Zero-Context Guard**:
-> credentials are resolved server-side and injected only through `$secureRequest`, a
-> host-allowlisted proxy that wraps the existing SSRF deny list. A redaction layer strips
-> token patterns from every tool output, error, log line, and trace event before it leaves
-> the process. Result: 10 confirmed OWASP LLM02 findings closed, 33 new tests, zero
-> breaking changes, no new dependencies.
+> Flowise is end-of-life and ships with critical vulnerabilities: every Custom Tool
+> executed by an LLM receives raw `$vars` — workspace secrets, API keys, and environment
+> variables — in plain text inside the sandbox. One prompt injection is all it takes to
+> exfiltrate them. We modernized this with a **Zero-Context Guard**: credentials resolve
+> server-side and reach the sandbox only through `$secureRequest`, a host-allowlisted
+> proxy backed by the existing SSRF deny list. Resolved credential values and static token
+> patterns are redacted from tool outputs and errors before leaving the process. Result:
+> 10 audit findings addressed, 46 new tests, zero breaking changes, no new dependencies.
 
 **Word count: 100**
 
@@ -125,18 +124,19 @@ resolved-secret pass already replaced the token with `[REDACTED]`.
 
 ## 4. Improvements Made
 
-| #   | Area                                                                             | Before                                                                       | After                                                                             | Finding closed |
-| --- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | -------------- |
-| 1   | Sandbox scope                                                                    | `$vars` with all secrets in scope (E2B + NodeVM)                             | `$vars` absent when `secretBindings` declared; `$secureRequest` injected instead  | F-01, F-02     |
-| 2   | E2B remote VM                                                                    | Full `$vars` serialised as `const $vars = {...}` and sent to e2b.dev         | E2B disabled for tools with secret bindings; NodeVM path used                     | F-01, F-05     |
-| 3   | SSRF in E2B                                                                      | No deny-list enforcement; sandbox called native `fetch` freely               | Blocked entirely — only `secureAxiosRequest` path available                       | F-05           |
-| 4   | Runtime env vars                                                                 | Any `process.env` key accessible via `runtime` variable                      | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `PASSWORD`, `FLOWISE_`, etc. | F-03           |
-| 5   | Tool output to LLM                                                               | Raw output (potentially containing secrets) returned as ToolMessage          | `redact()` applied before return in `_call()`                                     | F-02, F-04     |
-| 6   | SSE `agent_trace` stream                                                         | Raw tool output and error message emitted verbatim                           | `redact()` in `handleToolEnd` and `handleToolError`                               | F-04, F-06     |
-| 7   | Server logs                                                                      | `logger.verbose` received raw tool output at `DEBUG=true`                    | `redact()` in `onToolEnd` / `onToolError` before log write                        | F-08           |
-| 8   | Tracing providers (LangSmith, LangFuse, Lunary, Arize, Phoenix, LangWatch, Opik) | Received full unredacted tool output via LangChain callback chain            | Receive only post-`handleToolEnd` redacted string                                 | F-10           |
-| 9   | Error messages                                                                   | `NodeVM Execution Error: <original error>` could embed raw secret values     | `redact()` applied to caught error before re-throw                                | F-06           |
-| 10  | Outbound HTTP from sandbox                                                       | Sandbox could call `$vars.API_KEY` in headers; no server-side auth injection | Auth header injected by host process; sandbox never receives token value          | F-05           |
+| #   | Area                                                                             | Before                                                                       | After                                                                                                             | Finding    | Status                              |
+| --- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------- | ----------------------------------- |
+| 1   | Sandbox scope                                                                    | `$vars` with all secrets in scope (E2B + NodeVM)                             | `$vars` absent when `secretBindings` declared; `$secureRequest` injected instead                                  | F-01, F-02 | ✅ Closed (requires secretBindings) |
+| 2   | E2B remote VM                                                                    | Full `$vars` serialised as `const $vars = {...}` and sent to e2b.dev         | E2B disabled for tools with secret bindings; NodeVM path used                                                     | F-01, F-05 | ✅ Closed (requires secretBindings) |
+| 3   | SSRF in E2B                                                                      | No deny-list enforcement; sandbox called native `fetch` freely               | Blocked entirely — only `secureAxiosRequest` path available for binding tools                                     | F-05       | ✅ Closed (requires secretBindings) |
+| 4   | Runtime env vars                                                                 | Any `process.env` key accessible via `runtime` variable                      | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `PASSWORD`, `FLOWISE_`, etc. globally                        | F-03       | ✅ Closed (global)                  |
+| 5   | Tool output to LLM (binding tools)                                               | Raw output (potentially containing secrets) returned as ToolMessage          | `redact(result, resolvedSecretValues)` in `_call()` — static patterns + resolved credential values                | F-04       | ✅ Closed (requires secretBindings) |
+| 6   | Error messages (binding tools)                                                   | `NodeVM Execution Error: <original error>` could embed raw secret values     | `redact(error, resolvedSecretValues)` before re-throw — static patterns + resolved values                         | F-06       | ✅ Closed (requires secretBindings) |
+| 7   | SSE `agent_trace` stream                                                         | Raw tool output and error message emitted verbatim                           | `redact(output, [])` in `handleToolEnd` / `handleToolError` — static patterns only                                | F-04, F-06 | ⚠️ Partial (static patterns only)   |
+| 8   | Server logs                                                                      | `logger.verbose` received raw tool output at `DEBUG=true`                    | `redact(output, [])` in `onToolEnd` / `onToolError` — static patterns only                                        | F-08       | ⚠️ Partial (static patterns only)   |
+| 9   | Outbound HTTP from sandbox                                                       | Sandbox could call `$vars.API_KEY` in headers; no server-side auth injection | Auth header injected by host process; sandbox never receives token value                                          | F-05       | ✅ Closed (requires secretBindings) |
+| 10  | Redirect cross-host credential forwarding                                        | Authorization/Cookie forwarded on any redirect, even cross-origin            | Sensitive headers stripped when redirect changes hostname; `allowedHosts` re-checked per hop                      | (new)      | ✅ Closed                           |
+| 11  | Tracing providers (LangSmith, LangFuse, Lunary, Arize, Phoenix, LangWatch, Opik) | Received full unredacted tool output via LangChain callback chain            | Static-pattern redaction in `_call()` only; tracers receive `Run` objects directly from LangChain — not mitigated | F-10       | ⚠️ Not closed (see Known Limits)    |
 
 ### What did not change
 

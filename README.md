@@ -8,9 +8,11 @@
 > attacker needs to exfiltrate them. We modernized this with a **Zero-Context Guard**:
 > credentials are resolved server-side and injected only through `$secureRequest`, a
 > host-allowlisted proxy wrapping the existing SSRF deny list. A redaction layer strips
-> token patterns from Custom Tool outputs, errors, and log lines before they leave the
-> process. Result: 8 OWASP LLM02 findings fully closed, 2 partially mitigated, 33 new
-> tests, zero breaking changes, no new dependencies.
+> static token patterns (OpenAI, GitHub, Slack, Google, Bearer) and resolved credential
+> values from Custom Tool outputs and errors before they reach the LLM, SSE stream, or
+> server logs. Result: 3 findings fully closed, 4 closed for tools with secret bindings,
+> 2 partially mitigated, 1 not yet closed (F-10 tracing), 46 new tests, zero breaking
+> changes, no new dependencies.
 
 ---
 
@@ -99,28 +101,30 @@ path globally for every node type that calls `prepareSandboxVars`, not just Cust
 resolvedSecrets)` function applied at four boundaries within the Custom Tool execution
 path:
 
-| Applied at                                     | What it protects                                                                        |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `DynamicStructuredTool._call()` return value   | Static token patterns in Custom Tool output before it reaches LLM or SSE (F-04 partial) |
-| `DynamicStructuredTool._call()` catch block    | Static token patterns in error messages before re-throw (F-06 partial)                  |
-| `CustomStreamingHandler.handleToolEnd()`       | SSE `agent_trace` stream for any tool type (F-04)                                       |
-| `CustomStreamingHandler.handleToolError()`     | SSE error payload for any tool type (F-06)                                              |
-| `ConsoleCallbackHandler.onToolEnd/onToolError` | Verbose server logs at `DEBUG=true` for any tool type (F-08)                            |
+| Applied at                                     | What it protects                                                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `DynamicStructuredTool._call()` return value   | Static token patterns + resolved credential values in Custom Tool output before it reaches LLM or SSE (F-04) |
+| `DynamicStructuredTool._call()` catch block    | Static token patterns + resolved credential values in error messages before re-throw (F-06)                  |
+| `CustomStreamingHandler.handleToolEnd()`       | SSE `agent_trace` stream for any tool type — static patterns only (F-04 partial)                             |
+| `CustomStreamingHandler.handleToolError()`     | SSE error payload for any tool type — static patterns only (F-06 partial)                                    |
+| `ConsoleCallbackHandler.onToolEnd/onToolError` | Verbose server logs at `DEBUG=true` for any tool type — static patterns only (F-08)                          |
 
-> **Scope note:** The `_call()` redaction calls `redact(result, [])` — the resolved-secrets
-> array is always empty at that call site because credential values are never materialised
-> in the host process outside the `$secureRequest` closure. The redaction there applies
-> **static regex patterns only** (sk-, ghp\_, Bearer, xoxb-, AIza). For a tool using
-> `$secureRequest`, the secret value is never in a string that could reach `_call()`'s
-> return statement, making the empty-array call still correct.
+> **Resolved-secret redaction:** When a tool declares `secretBindings`, each time
+> `$secureRequest` resolves a credential it invokes an `onSecretResolved` callback in
+> `_call()` that appends the plaintext value to `resolvedSecretValues[]`. After execution,
+> `redact(result, resolvedSecretValues)` and `redact(error, resolvedSecretValues)` replace
+> any matching substrings with `[REDACTED]`. This closes F-04 and F-06 for tools that use
+> the Guard. For tools without `secretBindings` (legacy path), `resolvedSecretValues` is
+> `[]` and only static regex patterns fire.
 
-> **Tracing note (F-10):** `CustomStreamingHandler.handleToolEnd` applies `redact()` to
-> the SSE stream. Third-party tracing callbacks (LangSmith, LangFuse, Lunary, Arize,
+> **Tracing note (F-10, not yet closed):** `CustomStreamingHandler.handleToolEnd` covers
+> the SSE stream only. Third-party tracing callbacks (LangSmith, LangFuse, Lunary, Arize,
 > Phoenix, LangWatch, Opik) are registered as separate LangChain `BaseCallbackHandler`
 > instances and receive the raw `Run` object from LangChain's own tracer infrastructure —
-> not from `CustomStreamingHandler`. Their inputs are therefore protected only by the
-> static-pattern redaction that already happened in `_call()`, not by a per-tracing-provider
-> redaction pass. F-10 is partially mitigated.
+> **not** from `CustomStreamingHandler`. The `_call()` static-pattern redaction reduces
+> exposure for known token formats, but a custom credential value that matches no static
+> pattern will still reach all 7 providers. Per-provider redaction wrappers are not
+> implemented in this iteration. See [Known Limitations](#known-limitations) below.
 
 Static patterns caught without needing resolved secrets:
 
@@ -139,20 +143,21 @@ already replaced the token with `[REDACTED]`.
 
 ## Improvements Made
 
-| #   | Area                                                       | Before                                                              | After                                                                                      | Finding    | Status                      |
-| --- | ---------------------------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ---------- | --------------------------- |
-| 1   | Sandbox scope (Custom Tool)                                | `$vars` with all secrets in NodeVM scope                            | `$vars` absent when `secretBindings` declared; `$secureRequest` injected                   | F-02       | ✅ Closed                   |
-| 2   | E2B remote VM                                              | Full `$vars` serialised and sent to e2b.dev                         | E2B disabled for tools with secret bindings                                                | F-01       | ✅ Closed                   |
-| 3   | SSRF in E2B sandbox                                        | No deny-list; sandbox used native `fetch` freely                    | E2B blocked; only `secureAxiosRequest` path available                                      | F-05       | ✅ Closed                   |
-| 4   | Runtime env vars in `$vars`                                | Any `process.env` key reachable via `runtime` variable              | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `FLOWISE_`, etc.                      | F-03       | ✅ Closed                   |
-| 5   | Tool output to LLM                                         | Raw output returned as ToolMessage                                  | Static-pattern `redact()` applied in `_call()` before return                               | F-04       | ✅ Closed (static patterns) |
-| 6   | SSE `agent_trace` stream                                   | Raw output emitted verbatim                                         | `redact()` in `handleToolEnd` / `handleToolError`                                          | F-04, F-06 | ✅ Closed                   |
-| 7   | Server logs at verbose level                               | Raw output at `logger.verbose` when `DEBUG=true`                    | `redact()` in `onToolEnd` / `onToolError`                                                  | F-08       | ✅ Closed                   |
-| 8   | Error messages (Custom Tool)                               | Execution error could embed raw secret values                       | Static-pattern `redact()` applied before re-throw                                          | F-06       | ✅ Closed (static patterns) |
-| 9   | Outbound HTTP auth (Custom Tool)                           | Sandbox received raw token values; injected them in `fetch` headers | Auth header injected by host process; sandbox never receives token                         | F-05       | ✅ Closed                   |
-| 10  | Tracing providers (all 7 listed)                           | Received full unredacted output via LangChain callback chain        | Protected by static-pattern redaction in `_call()` only; per-provider pass not implemented | F-10       | ⚠️ Partial                  |
-| 11  | `$vars` in LLMNode / ConditionAgent / Condition / ToolNode | `$vars` with sensitive runtime vars in scope                        | Worst-case names blocked by denylist; full `$vars` removal deferred                        | F-07       | ⚠️ Partial                  |
-| 12  | `$vars` in ChatPromptTemplate                              | `$vars` in scope; sensitive key names reachable                     | Worst-case names blocked by denylist; full removal deferred                                | F-09       | ⚠️ Partial                  |
+| #   | Area                                                       | Before                                                              | After                                                                                                       | Finding    | Status                                |
+| --- | ---------------------------------------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------- |
+| 1   | Sandbox scope (Custom Tool)                                | `$vars` with all secrets in NodeVM scope                            | `$vars` absent when `secretBindings` declared; `$secureRequest` injected                                    | F-02       | ✅ Closed (requires secretBindings)   |
+| 2   | E2B remote VM                                              | Full `$vars` serialised and sent to e2b.dev                         | E2B disabled for tools with secret bindings                                                                 | F-01       | ✅ Closed (requires secretBindings)   |
+| 3   | SSRF in E2B sandbox                                        | No deny-list; sandbox used native `fetch` freely                    | E2B blocked; only `secureAxiosRequest` path available for binding tools                                     | F-05       | ✅ Closed (requires secretBindings)   |
+| 4   | Runtime env vars in `$vars`                                | Any `process.env` key reachable via `runtime` variable              | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `FLOWISE_`, etc. globally                              | F-03       | ✅ Closed (global)                    |
+| 5   | Tool output to LLM (binding tools)                         | Raw output returned as ToolMessage                                  | `redact(result, resolvedSecretValues)` in `_call()` — both static patterns and resolved values              | F-04       | ✅ Closed (requires secretBindings)   |
+| 6   | Error messages (binding tools)                             | Execution error could embed raw secret values                       | `redact(error, resolvedSecretValues)` before re-throw — both static patterns and resolved values            | F-06       | ✅ Closed (requires secretBindings)   |
+| 7   | SSE `agent_trace` stream                                   | Raw output emitted verbatim                                         | `redact(output, [])` in `handleToolEnd` / `handleToolError` — static patterns only                          | F-04, F-06 | ⚠️ Partial (static patterns only)     |
+| 8   | Server logs at verbose level                               | Raw output at `logger.verbose` when `DEBUG=true`                    | `redact(output, [])` in `onToolEnd` / `onToolError` — static patterns only                                  | F-08       | ⚠️ Partial (static patterns only)     |
+| 9   | Outbound HTTP auth (Custom Tool)                           | Sandbox received raw token values; injected them in `fetch` headers | Auth header injected by host process; sandbox never receives token                                          | F-05       | ✅ Closed (requires secretBindings)   |
+| 10  | Redirect cross-host credential forwarding                  | Authorization/Cookie forwarded on any redirect, even cross-origin   | Sensitive headers stripped when redirect changes hostname; `allowedHosts` re-checked per hop                | (new)      | ✅ Closed                             |
+| 11  | Tracing providers (all 7 listed)                           | Received full unredacted output via LangChain callback chain        | Protected by static-pattern redaction in `_call()` only; no per-provider wrapper; custom secrets still leak | F-10       | ⚠️ Not closed — see Known Limitations |
+| 12  | `$vars` in LLMNode / ConditionAgent / Condition / ToolNode | `$vars` with sensitive runtime vars in scope                        | Worst-case names blocked by denylist; full `$vars` removal deferred                                         | F-07       | ⚠️ Partial (denylist only)            |
+| 13  | `$vars` in ChatPromptTemplate                              | `$vars` in scope; sensitive key names reachable                     | Worst-case names blocked by denylist; full removal deferred                                                 | F-09       | ⚠️ Partial (denylist only)            |
 
 ### What did not change
 
@@ -162,6 +167,20 @@ already replaced the token with `[REDACTED]`.
 -   The SSRF deny list, NodeVM `axios`/`node-fetch` wrappers, and `secureAxiosRequest`
     are unchanged and continue to protect all tool types.
 -   All node types other than `CustomTool` are unmodified.
+
+---
+
+## Known Limitations
+
+The following gaps are documented honestly. They are deferred to a future iteration, not hidden.
+
+| Limitation                              | Affected findings            | Detail                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **F-10: tracing providers not covered** | F-10                         | LangSmith, LangFuse, Lunary, Arize, Phoenix, LangWatch, and Opik receive `Run` objects from LangChain's own callback chain — independently of `CustomStreamingHandler`. Static-pattern redaction in `_call()` catches known token formats; any custom secret value that does not match sk-, ghp\_, Bearer, xoxb-, or AIza will reach all 7 providers. A per-provider redaction wrapper (subclassing each `BaseCallbackHandler`) is the correct fix. |
+| **F-07/F-09: other node types**         | F-07, F-09                   | `$vars` is still present in LLMNode, Agent, ConditionAgent, Condition, ToolNode, and ChatPromptTemplate sandboxes. The 14-pattern denylist blocks the worst-case keys (`FLOWISE_SECRETKEY_OVERWRITE`, `OPENAI_API_KEY`, etc.) globally, but non-blocked variable names remain accessible. Full `$vars` removal from these nodes is deferred.                                                                                                        |
+| **Secrets < 8 chars not redacted**      | F-04, F-06                   | `guardRedact.ts` sets `MIN_SECRET_LENGTH = 8` to avoid false positives. Short credential values are not redacted.                                                                                                                                                                                                                                                                                                                                   |
+| **No base64 / URL-encoded variants**    | F-04, F-06                   | Redaction operates on plaintext. A secret value that has been base64-encoded or percent-encoded before appearing in output will not be caught.                                                                                                                                                                                                                                                                                                      |
+| **Legacy tools (no secretBindings)**    | F-01, F-02, F-04, F-05, F-06 | All Guard protections for secret isolation and resolved-secret redaction require the admin to declare `secretBindings`. Tools that do not declare bindings continue to receive `$vars` and are not protected by the Guard's secret isolation layer.                                                                                                                                                                                                 |
 
 ---
 
@@ -229,20 +248,24 @@ invented. See [`docs/BOB_LOG.md`](docs/BOB_LOG.md) for the per-session log.
 ```
 packages/components/
   src/
-    guardRedact.ts          ← NEW: pure redact() function (static token patterns)
+    guardRedact.ts          ← NEW: pure redact() function (static token patterns + resolved secrets)
     guardRedact.test.ts     ← NEW: 20 tests
-    guardRequest.ts         ← NEW: makeSecureRequestHelper factory + SecretBinding type
-    guardRequest.test.ts    ← NEW: 13 tests
+    guardRequest.ts         ← NEW: makeSecureRequestHelper factory + onSecretResolved callback
+    guardRequest.test.ts    ← NEW: 20 tests (incl. redirect + onSecretResolved)
+    httpSecurity.ts         ← MODIFIED: cross-host redirect strips sensitive headers
+    httpSecurity.test.ts    ← MODIFIED: 9 new redirect header-stripping tests
     utils.ts                ← MODIFIED: BLOCKED_ENV_KEY_PATTERNS, secureRequestHelper param, disableE2B flag
     handler.ts              ← MODIFIED: redact() in 4 callback methods
   nodes/tools/CustomTool/
-    core.ts                 ← MODIFIED: secretBindings field, $secureRequest wiring, redact() on outputs/errors
+    core.ts                 ← MODIFIED: secretBindings, $secureRequest wiring, resolvedSecretValues collection
+    core.test.ts            ← NEW: 6 tests for resolved-secret redaction
     CustomTool.ts           ← MODIFIED: parse + attach secretBindings from nodeData.inputs
 
 docs/
   BASELINE.md               ← pre-Guard and post-Guard test snapshots
   AUDIT.md                  ← 10 confirmed findings, 5 disproved
   DESIGN.md                 ← full technical specification
+  REVIEW.md                 ← self-review findings and fix list
   BOB_LOG.md                ← per-session IBM Bob usage log
   HACKATHON_README.md       ← original submission README
   FLOWISE_README.md         ← original Flowise README (preserved)
@@ -253,12 +276,12 @@ docs/
 ```bash
 pnpm install
 pnpm --filter flowise-components exec jest --ci --forceExit --silent
-# Expected: Test Suites: 22 passed  Tests: 943 passed  Time: ~110 s
+# Expected: Test Suites: 25 passed  Tests: ~989 passed  Time: ~115 s
 ```
 
 ---
 
-_Branch: `zero-context-guard` · Commit: `8c485a9d` · IBM Bob Hackathon 2025 · Theme 2: Modernize What Matters_
+_Branch: `zero-context-guard` · Commits: `8c485a9d` → `4cff856f` → `5242be3c` · IBM Bob Hackathon 2025 · Theme 2: Modernize What Matters_
 
 ---
 

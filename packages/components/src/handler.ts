@@ -2007,8 +2007,11 @@ export class CustomStreamingHandler extends BaseCallbackHandler {
         if (!this.sseStreamer) return
 
         const rawOutput = typeof output === 'string' ? output : JSON.stringify(output, null, 2)
-        // Zero-Context Guard: redact before emitting over SSE / to tracing
-        // providers that share the same callback chain (F-04, F-10).
+        // Zero-Context Guard: redact static token patterns before emitting over SSE (F-04).
+        // NOTE: resolvedSecrets is [] here — only static patterns (sk-, ghp_, Bearer, etc.) fire.
+        // Third-party tracing providers (LangSmith, LangFuse, etc.) are separate
+        // BaseCallbackHandler instances that receive Run objects directly from LangChain;
+        // they are NOT downstream of this method. F-10 is NOT closed by this line.
         const toolOutput = redact(rawOutput, [])
 
         // Stream the tool output details using the agent_trace event type for consistency
