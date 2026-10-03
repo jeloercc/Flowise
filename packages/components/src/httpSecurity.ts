@@ -146,6 +146,41 @@ export interface SecureRequestAgentOptions {
 }
 
 /**
+ * Makes a single hop HTTP request (no redirect following) with:
+ *   - SSRF deny-list validation via resolveAndValidate
+ *   - IP-pinning via createPinnedAgent to eliminate the DNS-rebinding TOCTOU
+ *     window that exists when checkDenyList and axios are called separately
+ *
+ * Returns the raw AxiosResponse, including 3xx redirect responses.
+ * The caller is responsible for following (or refusing) redirects.
+ *
+ * Used by makeSecureRequestHelper in guardRequest.ts so that each hop in its
+ * own redirect loop is protected against DNS rebinding.
+ *
+ * @param config - Axios request configuration.  url is required.
+ * @param agentOptions - Optional TLS options (e.g. custom CA).
+ */
+export async function secureAxiosSingleHop(config: AxiosRequestConfig, agentOptions?: SecureRequestAgentOptions): Promise<AxiosResponse> {
+    if (!config.url) {
+        throw new Error('secureAxiosSingleHop: url is required')
+    }
+    const target = await resolveAndValidate(config.url)
+    const agent = createPinnedAgent(target, agentOptions)
+    const agentConfig: AxiosRequestConfig =
+        target.protocol === 'http' ? { httpAgent: agent, httpsAgent: undefined } : { httpsAgent: agent, httpAgent: undefined }
+    return axios({
+        ...config,
+        ...agentConfig,
+        maxRedirects: 0,
+        validateStatus: () => true,
+        headers: {
+            ...config.headers,
+            Host: target.hostname
+        }
+    })
+}
+
+/**
  * Pattern for header names that carry credentials and must NOT be forwarded
  * when a redirect changes the origin (host).
  * Matches: Authorization, Cookie, X-Api-Key, X-Auth-Token, X-Secret, etc.

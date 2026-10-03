@@ -229,4 +229,62 @@ The check is clean.
 
 ---
 
+---
+
+## 7. Post-refactor Security Review: `guardRequest.ts` — `checkDenyList + axios` → `secureAxiosSingleHop`
+
+**Review date:** 2025-07-30
+**Commit under review:** `40f81c23` (guardRequest uses `checkDenyList + axios`) vs fix in this session.
+
+### 2a — DNS-rebinding TOCTOU window
+
+**Finding (original `checkDenyList + axios` pattern):** `CONFIRMED vulnerability`.
+
+`checkDenyList(url)` at [`guardRequest.ts:226`](packages/components/src/guardRequest.ts) resolved the hostname, validated the resulting IPs, then returned. `axios({url, ...})` then resolved the hostname **again** independently. Between the two calls, a DNS rebinding attack could swap the IP (e.g. from a public IP to `169.254.169.254`) — the check would pass but the connection would reach the new IP.
+
+By contrast, `secureAxiosRequest` (and now `secureAxiosSingleHop`) pins the resolved IP into the `http.Agent.lookup` callback, so the TCP connection is always made to the IP that was validated. See [`httpSecurity.ts:163–181`](packages/components/src/httpSecurity.ts) (`secureAxiosSingleHop`) and [`httpSecurity.ts:432–451`](packages/components/src/httpSecurity.ts) (`createPinnedAgent`).
+
+**Fix applied:** `guardRequest.ts` now calls `secureAxiosSingleHop` per hop (commit in this session). The TOCTOU window is closed: DNS is resolved once, validated once, and the same IP is pinned into the agent for the actual TCP connection.
+
+**Evidence:** `guardRequest.ts:230–236` — `secureAxiosSingleHop({url, method, data, headers})`.
+
+### 2b — Cross-host header stripping on allowed redirect
+
+**Finding (original implementation):** `CONFIRMED gap`.
+
+When the redirect destination was a DIFFERENT host but still within `allowedHosts`, the guard followed the redirect without stripping `Authorization`, `Cookie`, or other sensitive headers. This meant a credential leaked to the second allowed host when the sandbox was only intended to call the first.
+
+**Fix applied:** `guardRequest.ts:289–302` — after every redirect, if `nextHostname !== originHostname`, sensitive headers matching the pattern `/key|token|secret|auth|cookie/i` (plus explicit `authorization` and `cookie`) are removed before the next hop.
+
+**New test:** `guardRequest.test.ts` — _"strips Authorization on cross-host redirect within allowedHosts"_ (test 17 of 25) verifies that the second-hop `secureAxiosSingleHop` call does NOT receive `Authorization`.
+
+**Evidence:** `guardRequest.ts:289–302` (stripping logic); `guardRequest.test.ts` line ~229 (new test).
+
+### 2c — Non-allowed host blocked on every hop; `maxRedirects` bounded
+
+**Verified:** `CORRECT`.
+
+-   Non-allowed host blocking: `guardRequest.ts:276–287` — `if (!allowed.includes(nextHostname)) { throw ... }`. Runs before every `secureAxiosSingleHop` call that would follow the redirect. Tests: `"blocks redirect to a host not in allowedHosts"`, `"emits a blocked event when redirect goes to non-allowed host"`.
+-   Max redirects: `guardRequest.ts:25` — `MAX_GUARD_REDIRECTS = 5`; loop at line 225 — `while (redirects <= MAX_GUARD_REDIRECTS)`; check at line 268 — `if (redirects > MAX_GUARD_REDIRECTS) throw`. Also bounded by `secureAxiosSingleHop` which sets `maxRedirects: 0` in the underlying axios call — so each call handles exactly one request, never auto-follows.
+
+### 3 — `createPinnedAgent` scalar callback: pre-existing upstream bug
+
+**Confirmed pre-existing:** The `createPinnedAgent` function in upstream Flowise (`FlowiseAI/Flowise`, `main` branch) used:
+
+```ts
+lookup: (_host, _opts, cb) => {
+    cb(null, target.ip, target.family)
+}
+```
+
+This is the scalar form `cb(null, address, family)`. Node's `http.Agent` calls the custom `lookup` function with `{ all: true }` in `opts` when it needs all addresses. When `opts.all` is set, the callback contract changes to the array form: `cb(null, [{address, family}])`. Passing scalars when `all:true` is requested causes Node's internals to call `ipaddr.parse(undefined)` → `"Invalid IP address: undefined"`.
+
+**Verified:** `git diff upstream/main -- packages/components/src/httpSecurity.ts` shows `createPinnedAgent` was introduced by upstream as part of the SSRF pinning feature, and the upstream version uses only the scalar form. Our fork introduced the `opts.all` guard — confirmed in commit `baeef186`.
+
+**Node versions where it triggers:** Any Node.js version where `http.Agent` calls the custom `lookup` with `{ all: true }`. This is observed on Node v24.11.0 (the test environment). The `{ all: true }` behavior has been present since at least Node v12 (see `lib/_http_agent.js`), so this bug affects all Node versions in the Flowise supported range (≥20).
+
+**Fix:** `httpSecurity.ts:432–451` (`createPinnedAgent`) — checks `opts && opts.all` and returns the array form when required; falls back to scalar form otherwise. Covered by `httpSecurity.pinnedAgent.test.ts` — 4 integration tests with real TCP servers (commit `baeef186`).
+
+---
+
 _This document was produced by IBM Bob. All findings cite the exact file and line._

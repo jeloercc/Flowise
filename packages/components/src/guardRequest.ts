@@ -10,15 +10,18 @@
  *      exact-match semantics — no substring or prefix matching.
  *   3. `allowedHosts` is re-checked on EVERY redirect hop, not only the
  *      initial URL.  A redirect to a non-allowed host throws immediately.
- *   4. The actual HTTP call goes through `secureAxiosRequest`, which enforces
- *      the SSRF deny list and validates every redirect hop.
- *   5. Neither the credentialId nor the resolved secret value appears in any
+ *   4. Each hop uses `secureAxiosSingleHop`, which resolves DNS once, validates
+ *      the resolved IP against the SSRF deny list, and pins that IP into the
+ *      agent — eliminating the DNS-rebinding TOCTOU window.
+ *   5. On a redirect to a DIFFERENT hostname (even within allowedHosts),
+ *      Authorization, Cookie, and any key/token/secret/auth header are stripped
+ *      before the next hop.  Same-hostname redirects keep all headers.
+ *   6. Neither the credentialId nor the resolved secret value appears in any
  *      thrown error message.
  */
 
-import axios from 'axios'
 import { ICommonObject } from './Interface'
-import { checkDenyList } from './httpSecurity'
+import { secureAxiosSingleHop } from './httpSecurity'
 import { getCredentialData } from './utils'
 
 /** Maximum number of redirects the guard will follow. */
@@ -213,9 +216,17 @@ export function makeSecureRequestHelper(
             }
         }
 
-        // 5. Execute hop-by-hop: SSRF-check each URL via checkDenyList, then
-        //    call axios with maxRedirects:0/validateStatus so we get the raw
-        //    response and can re-check allowedHosts on every redirect hop.
+        // 5. Execute hop-by-hop via secureAxiosSingleHop:
+        //    - resolveAndValidate: DNS lookup + SSRF deny-list check
+        //    - createPinnedAgent: binds the validated IP into the agent so
+        //      the actual TCP connection uses the same IP that was checked,
+        //      eliminating the DNS-rebinding TOCTOU window.
+        //    - Returns raw AxiosResponse (including 3xx); this loop handles
+        //      redirects so allowedHosts can be re-checked on every hop.
+        //
+        //    originHostname is used to detect cross-host redirects so that
+        //    sensitive headers can be stripped before forwarding (invariant 5).
+        const originHostname = safeHostname(url)
         let currentUrl = url
         let currentHeaders = interpolated
         let method = requestOptions.method ?? 'GET'
@@ -223,16 +234,11 @@ export function makeSecureRequestHelper(
         let redirects = 0
 
         while (redirects <= MAX_GUARD_REDIRECTS) {
-            // SSRF check before every hop (replaces secureAxiosRequest's resolveAndValidate).
-            await checkDenyList(currentUrl)
-
-            const response = await axios({
+            const response = await secureAxiosSingleHop({
                 url: currentUrl,
                 method,
                 data,
-                headers: currentHeaders,
-                maxRedirects: 0,
-                validateStatus: () => true
+                headers: currentHeaders
             })
 
             // Not a redirect — return the final response.
@@ -282,6 +288,20 @@ export function makeSecureRequestHelper(
             }
 
             currentUrl = nextUrl
+
+            // Strip sensitive credential headers on cross-host redirects (invariant 5).
+            // Same-hostname redirects keep all headers unchanged.
+            if (nextHostname !== originHostname) {
+                const stripped: Record<string, string> = {}
+                const SENSITIVE = /key|token|secret|auth|cookie/i
+                for (const [k, v] of Object.entries(currentHeaders)) {
+                    if (k.toLowerCase() === 'authorization' || k.toLowerCase() === 'cookie' || SENSITIVE.test(k)) {
+                        continue
+                    }
+                    stripped[k] = v
+                }
+                currentHeaders = stripped
+            }
 
             // Honour standard redirect method semantics.
             if (
