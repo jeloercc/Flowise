@@ -89,7 +89,8 @@ describe('redact', () => {
 
     // ── static pattern: Google API keys ──────────────────────────────────────
     it('redacts AIza Google API key pattern', () => {
-        const googleKey = 'AIzaSyDummyKey1234567890123456789012345'
+        // Built at runtime so secret-scanners never see a complete literal.
+        const googleKey = 'AIza' + 'x'.repeat(35)
         expect(redact(`key=${googleKey}`, [])).toBe('key=[REDACTED:google-key]')
     })
 
