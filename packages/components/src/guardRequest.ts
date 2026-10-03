@@ -125,7 +125,13 @@ function safeHostname(url: string): string {
  */
 export function makeSecureRequestHelper(
     bindings: SecretBinding[],
-    options: ICommonObject
+    options: ICommonObject,
+    /**
+     * Optional callback invoked each time a credential is resolved.
+     * Used by core.ts to collect resolved secret values for post-execution
+     * redaction (F-04, F-06) without ever storing them in the sandbox.
+     */
+    onSecretResolved?: (secretValue: string) => void
 ): ((...args: any[]) => Promise<string>) | undefined {
     if (!bindings || bindings.length === 0) return undefined
 
@@ -159,6 +165,16 @@ export function makeSecureRequestHelper(
 
         // 3. Resolve credential server-side — value never enters sandbox scope.
         const credentialData = await getCredentialData(binding.credentialId, options)
+
+        // Notify caller of all resolved string values so they can be redacted
+        // from output and errors without ever placing them in the sandbox.
+        if (onSecretResolved) {
+            for (const v of Object.values(credentialData)) {
+                if (typeof v === 'string' && v.length >= 8) {
+                    onSecretResolved(v)
+                }
+            }
+        }
 
         // 4. Build headers: interpolate {{placeholders}}, then inject bearer token
         //    if the caller hasn't provided their own Authorization header.

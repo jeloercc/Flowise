@@ -132,14 +132,19 @@ export class DynamicStructuredTool<
         // When secret bindings are declared, inject $secureRequest and remove
         // $vars from scope so raw secret values never enter the sandbox (F-01, F-02, F-05).
         const hasBindings = this.secretBindings.length > 0
-        const secureRequestHelper = hasBindings ? makeSecureRequestHelper(this.secretBindings, this.executionOptions) : undefined
-
-        const sandbox = createCodeExecutionSandbox('', this.variables || [], flow, additionalSandbox, secureRequestHelper)
 
         // Collect resolved secret values for post-execution redaction (F-04, F-06).
-        // We collect them here lazily so they are never stored longer than needed.
-        // Note: these strings are in the host process only and never enter the sandbox.
-        let resolvedSecretValues: string[] = []
+        // The onSecretResolved callback appends each credential value as it is
+        // resolved inside the $secureRequest closure — in the host process only,
+        // never in the sandbox.  This ensures redact() has the real values, not [].
+        const resolvedSecretValues: string[] = []
+        const secureRequestHelper = hasBindings
+            ? makeSecureRequestHelper(this.secretBindings, this.executionOptions, (v) => {
+                  resolvedSecretValues.push(v)
+              })
+            : undefined
+
+        const sandbox = createCodeExecutionSandbox('', this.variables || [], flow, additionalSandbox, secureRequestHelper)
 
         let response: any
         try {

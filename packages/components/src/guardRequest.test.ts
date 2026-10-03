@@ -247,3 +247,78 @@ describe('$secureRequest — redirect allowedHosts re-check', () => {
         await expect(helper('api', 'https://api.allowed.com/data', {})).resolves.toBeDefined()
     })
 })
+
+// ── Integration: onSecretResolved callback populates resolvedSecretValues ─────
+
+describe('makeSecureRequestHelper — onSecretResolved callback (F-04, F-06 fix)', () => {
+    // Use the REAL guardRequest module for this test (unmock it).
+    // We mock only httpSecurity and utils at module level above.
+
+    beforeEach(() => {
+        jest.resetAllMocks()
+        mockSecureAxios.mockResolvedValue({ data: 'ok', status: 200 } as any)
+        mockGetCred.mockResolvedValue({ token: 'placeholder-token-1234' })
+    })
+
+    it('invokes onSecretResolved with resolved credential string values', async () => {
+        const collected: string[] = []
+        mockGetCred.mockResolvedValue({
+            password: 'my-custom-db-password-xyz-99999',
+            username: 'dbuser1234'
+        })
+
+        const helper = makeSecureRequestHelper(
+            [{ name: 'db', credentialId: 'cred-db', allowedHosts: ['db.example.com'] }],
+            fakeOptions,
+            (v) => collected.push(v)
+        )!
+
+        await helper('db', 'https://db.example.com/query', {})
+
+        expect(collected).toContain('my-custom-db-password-xyz-99999')
+        expect(collected).toContain('dbuser1234')
+    })
+
+    it('does not invoke onSecretResolved before the request is made', async () => {
+        const collected: string[] = []
+        mockGetCred.mockResolvedValue({ token: 'some-token-12345' })
+
+        makeSecureRequestHelper([{ name: 'svc', credentialId: 'cred-svc', allowedHosts: ['svc.example.com'] }], fakeOptions, (v) =>
+            collected.push(v)
+        )
+
+        // Callback must NOT be called at factory time — only when $secureRequest is invoked
+        expect(collected).toHaveLength(0)
+    })
+
+    it('does not call onSecretResolved for values shorter than 8 chars', async () => {
+        const collected: string[] = []
+        mockGetCred.mockResolvedValue({ short: 'abc', long: 'long-value-12345678' })
+
+        const helper = makeSecureRequestHelper(
+            [{ name: 'svc', credentialId: 'cred-svc', allowedHosts: ['svc.example.com'] }],
+            fakeOptions,
+            (v) => collected.push(v)
+        )!
+
+        await helper('svc', 'https://svc.example.com/api', {})
+
+        expect(collected).not.toContain('abc')
+        expect(collected).toContain('long-value-12345678')
+    })
+
+    it('custom secret missing from static patterns IS redacted via resolved path', () => {
+        const { redact: realRedact } = jest.requireActual('./guardRedact') as { redact: (text: string, secrets: string[]) => string }
+
+        const secret = 'my-custom-db-password-xyz-99999'
+        const output = `query result: ${secret} was found`
+
+        // Without resolved secrets: static patterns do not catch it
+        expect(realRedact(output, [])).toBe(output)
+
+        // With resolved secrets: it IS caught
+        const redacted = realRedact(output, [secret])
+        expect(redacted).not.toContain(secret)
+        expect(redacted).toContain('[REDACTED]')
+    })
+})
