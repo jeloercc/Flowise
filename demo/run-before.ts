@@ -14,9 +14,18 @@
  *   The Authorization header is forwarded to Server B verbatim.
  *
  * Nothing here uses the guard. This is the unpatched behaviour.
+ *
+ * Hard internal timeout: 30 s (process.exit(2) + "TIMEOUT" message).
  */
 
-// ── Allow localhost for demo (bypass SSRF deny-list) ─────────────────────────
+// ── Hard timeout: kills the process after 30 s ────────────────────────────────
+const hardTimeout = setTimeout(() => {
+    console.error('TIMEOUT: demo/run-before.ts exceeded 30 s')
+    process.exit(2)
+}, 30_000)
+hardTimeout.unref() // don't let this timer itself prevent exit
+
+// ── Allow localhost / private IPs for demo (bypass SSRF deny-list) ────────────
 process.env.HTTP_SECURITY_CHECK = 'false'
 
 import * as http from 'http'
@@ -124,7 +133,12 @@ async function main() {
     console.log('  Run demo/after.sh to see the guarded behaviour.\n')
 }
 
-main().catch((err) => {
-    console.error(err)
-    process.exit(1)
-})
+main()
+    .catch((err) => {
+        console.error(err)
+        process.exit(1)
+    })
+    .finally(() => {
+        clearTimeout(hardTimeout)
+        process.exit(0)
+    })

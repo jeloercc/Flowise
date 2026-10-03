@@ -16,12 +16,30 @@
  *      thrown error message.
  */
 
+import axios from 'axios'
 import { ICommonObject } from './Interface'
-import { secureAxiosRequest } from './httpSecurity'
+import { checkDenyList } from './httpSecurity'
 import { getCredentialData } from './utils'
 
 /** Maximum number of redirects the guard will follow. */
 const MAX_GUARD_REDIRECTS = 5
+
+/**
+ * Audit event emitted by the guard on every $secureRequest call.
+ * Never contains resolved secret values.
+ */
+export interface GuardAuditEvent {
+    /** ISO timestamp of the request. */
+    ts: string
+    /** Binding name used by the sandbox call (not the credentialId). */
+    binding: string
+    /** Lowercased hostname of the final destination URL. */
+    host: string
+    /** 'allowed' if the guard completed the request, 'blocked' if it threw. */
+    outcome: 'allowed' | 'blocked'
+    /** If outcome is 'blocked', the reason. Never contains a secret value. */
+    reason?: string
+}
 
 /** Admin-declared binding between a name alias and a stored credential. */
 export interface SecretBinding {
@@ -131,7 +149,12 @@ export function makeSecureRequestHelper(
      * Used by core.ts to collect resolved secret values for post-execution
      * redaction (F-04, F-06) without ever storing them in the sandbox.
      */
-    onSecretResolved?: (secretValue: string) => void
+    onSecretResolved?: (secretValue: string) => void,
+    /**
+     * Optional callback invoked after every $secureRequest call with an
+     * audit event.  The event never contains resolved secret values.
+     */
+    onAudit?: (event: GuardAuditEvent) => void
 ): ((...args: any[]) => Promise<string>) | undefined {
     if (!bindings || bindings.length === 0) return undefined
 
@@ -160,7 +183,11 @@ export function makeSecureRequestHelper(
         const hostname = safeHostname(url)
         const allowed = binding.allowedHosts.map((h) => h.toLowerCase())
         if (!allowed.includes(hostname)) {
-            throw new Error(`$secureRequest: host "${hostname}" is not in allowedHosts for binding "${name}"`)
+            const reason = `host "${hostname}" is not in allowedHosts for binding "${name}"`
+            if (onAudit) {
+                onAudit({ ts: new Date().toISOString(), binding: name, host: hostname, outcome: 'blocked', reason })
+            }
+            throw new Error(`$secureRequest: ${reason}`)
         }
 
         // 3. Resolve credential server-side — value never enters sandbox scope.
@@ -186,8 +213,9 @@ export function makeSecureRequestHelper(
             }
         }
 
-        // 5. Execute through secureAxiosRequest with maxRedirects=0 so we can
-        //    re-check allowedHosts on every redirect hop before following it.
+        // 5. Execute hop-by-hop: SSRF-check each URL via checkDenyList, then
+        //    call axios with maxRedirects:0/validateStatus so we get the raw
+        //    response and can re-check allowedHosts on every redirect hop.
         let currentUrl = url
         let currentHeaders = interpolated
         let method = requestOptions.method ?? 'GET'
@@ -195,18 +223,28 @@ export function makeSecureRequestHelper(
         let redirects = 0
 
         while (redirects <= MAX_GUARD_REDIRECTS) {
-            const response = await secureAxiosRequest(
-                {
-                    url: currentUrl,
-                    method,
-                    data,
-                    headers: currentHeaders
-                },
-                0 /* maxRedirects — guard handles redirect loop itself */
-            )
+            // SSRF check before every hop (replaces secureAxiosRequest's resolveAndValidate).
+            await checkDenyList(currentUrl)
+
+            const response = await axios({
+                url: currentUrl,
+                method,
+                data,
+                headers: currentHeaders,
+                maxRedirects: 0,
+                validateStatus: () => true
+            })
 
             // Not a redirect — return the final response.
             if (response.status < 300 || response.status >= 400) {
+                if (onAudit) {
+                    onAudit({
+                        ts: new Date().toISOString(),
+                        binding: name,
+                        host: new URL(currentUrl).hostname.toLowerCase(),
+                        outcome: 'allowed'
+                    })
+                }
                 if (typeof response.data === 'string') return response.data
                 return JSON.stringify(response.data)
             }
@@ -214,6 +252,14 @@ export function makeSecureRequestHelper(
             const location = (response.headers as any)?.location
             if (!location) {
                 // Redirect with no Location header — return as-is.
+                if (onAudit) {
+                    onAudit({
+                        ts: new Date().toISOString(),
+                        binding: name,
+                        host: new URL(currentUrl).hostname.toLowerCase(),
+                        outcome: 'allowed'
+                    })
+                }
                 if (typeof response.data === 'string') return response.data
                 return JSON.stringify(response.data)
             }
@@ -228,7 +274,11 @@ export function makeSecureRequestHelper(
 
             // Re-check allowedHosts for every redirect destination.
             if (!allowed.includes(nextHostname)) {
-                throw new Error(`$secureRequest: redirect to host "${nextHostname}" is not in allowedHosts for binding "${name}"`)
+                const reason = `redirect to host "${nextHostname}" is not in allowedHosts for binding "${name}"`
+                if (onAudit) {
+                    onAudit({ ts: new Date().toISOString(), binding: name, host: nextHostname, outcome: 'blocked', reason })
+                }
+                throw new Error(`$secureRequest: ${reason}`)
             }
 
             currentUrl = nextUrl

@@ -1,15 +1,18 @@
 /**
  * Unit tests for the Zero-Context Guard request helper.
  *
- * We mock secureAxiosRequest so no real network calls are made.
+ * We mock axios and checkDenyList so no real network calls are made.
  * All credential resolution is simulated via a stub options object.
  */
 import { makeSecureRequestHelper, SecretBinding } from './guardRequest'
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
+// Mock axios default export (used by guardRequest for per-hop requests)
+jest.mock('axios')
+
 jest.mock('./httpSecurity', () => ({
-    secureAxiosRequest: jest.fn()
+    checkDenyList: jest.fn().mockResolvedValue(undefined)
 }))
 
 // We mock getCredentialData at the utils module level used inside guardRequest.
@@ -17,10 +20,12 @@ jest.mock('./utils', () => ({
     getCredentialData: jest.fn()
 }))
 
-import { secureAxiosRequest } from './httpSecurity'
+import axios from 'axios'
+import { checkDenyList } from './httpSecurity'
 import { getCredentialData } from './utils'
 
-const mockSecureAxios = secureAxiosRequest as jest.MockedFunction<typeof secureAxiosRequest>
+const mockAxios = axios as jest.MockedFunction<typeof axios>
+const mockCheckDenyList = checkDenyList as jest.MockedFunction<typeof checkDenyList>
 const mockGetCred = getCredentialData as jest.MockedFunction<typeof getCredentialData>
 
 // Shared fake options object (simulates what core.ts passes in)
@@ -42,7 +47,8 @@ const binding: SecretBinding = {
 beforeEach(() => {
     jest.clearAllMocks()
     mockGetCred.mockResolvedValue({ githubToken: FAKE_GH_TOKEN })
-    mockSecureAxios.mockResolvedValue({ data: '{"ok":true}', status: 200 } as any)
+    mockCheckDenyList.mockResolvedValue(undefined)
+    mockAxios.mockResolvedValue({ data: '{"ok":true}', status: 200, headers: {} } as any)
 })
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -64,12 +70,13 @@ describe('makeSecureRequestHelper', () => {
             const result = await helper('github', 'https://api.github.com/repos/test', {})
 
             expect(mockGetCred).toHaveBeenCalledWith('cred-uuid-1234', fakeOptions)
-            expect(mockSecureAxios).toHaveBeenCalledWith(
+            expect(mockAxios).toHaveBeenCalledWith(
                 expect.objectContaining({
                     url: 'https://api.github.com/repos/test',
-                    method: 'GET'
-                }),
-                0 // guard manages redirects itself, passes maxRedirects=0 to secureAxiosRequest
+                    method: 'GET',
+                    maxRedirects: 0,
+                    validateStatus: expect.any(Function)
+                })
             )
             expect(result).toBe('{"ok":true}')
         })
@@ -78,13 +85,12 @@ describe('makeSecureRequestHelper', () => {
             const helper = makeSecureRequestHelper([binding], fakeOptions)!
             await helper('github', 'https://api.github.com/user', {})
 
-            expect(mockSecureAxios).toHaveBeenCalledWith(
+            expect(mockAxios).toHaveBeenCalledWith(
                 expect.objectContaining({
                     headers: expect.objectContaining({
                         Authorization: `Bearer ${FAKE_GH_TOKEN}`
                     })
-                }),
-                0 // guard manages redirects itself
+                })
             )
         })
 
@@ -101,7 +107,7 @@ describe('makeSecureRequestHelper', () => {
             })
 
             // The helper must substitute {{apiKey}} with the resolved value
-            const call = mockSecureAxios.mock.calls[0][0]
+            const call = mockAxios.mock.calls[0][0] as any
             expect(Object.values(call.headers ?? {}).some((v) => v === 'my-raw-key-12345678')).toBe(true)
         })
 
@@ -150,7 +156,7 @@ describe('makeSecureRequestHelper', () => {
         })
 
         it('returns response data as a string', async () => {
-            mockSecureAxios.mockResolvedValueOnce({ data: { nested: 'object' }, status: 200 } as any)
+            mockAxios.mockResolvedValueOnce({ data: { nested: 'object' }, status: 200, headers: {} } as any)
             const helper = makeSecureRequestHelper([binding], fakeOptions)!
             const result = await helper('github', 'https://api.github.com/repo', {})
             expect(typeof result).toBe('string')
@@ -179,18 +185,9 @@ describe('makeSecureRequestHelper', () => {
 
 describe('$secureRequest — redirect allowedHosts re-check', () => {
     /**
-     * These tests verify that when secureAxiosRequest follows a redirect,
-     * guardRequest re-checks allowedHosts against the redirect destination.
-     * A redirect to a host NOT in allowedHosts must throw even if the
-     * original URL was allowed.
-     *
-     * We simulate redirect behaviour by making mockSecureAxios throw the
-     * error that the implementation is expected to throw when it re-validates
-     * the redirect target URL against allowedHosts.
-     *
-     * For the positive case (redirect within allowed host), we verify the
-     * request completes normally when secureAxiosRequest is called with the
-     * final allowed URL.
+     * These tests verify that when axios returns a redirect response,
+     * guardRequest re-checks allowedHosts against the redirect destination
+     * before following it.
      */
 
     const redirectBinding: SecretBinding = {
@@ -202,7 +199,8 @@ describe('$secureRequest — redirect allowedHosts re-check', () => {
     beforeEach(() => {
         jest.clearAllMocks()
         mockGetCred.mockResolvedValue({ token: 'tok-FAKE-REDIRECT-12345' })
-        mockSecureAxios.mockResolvedValue({ data: 'ok', status: 200 } as any)
+        mockCheckDenyList.mockResolvedValue(undefined)
+        mockAxios.mockResolvedValue({ data: 'ok', status: 200, headers: {} } as any)
     })
 
     it('allows request when initial URL is in allowedHosts', async () => {
@@ -211,20 +209,9 @@ describe('$secureRequest — redirect allowedHosts re-check', () => {
     })
 
     it('blocks redirect to a host not in allowedHosts', async () => {
-        // Simulate: secureAxiosRequest follows a redirect to evil.example.com.
-        // The guard must re-check the redirect destination against allowedHosts
-        // before calling secureAxiosRequest (or by intercepting the result).
-        // We test the guard's own pre-call check by having it receive a
-        // redirect response whose Location header points outside allowedHosts.
-        //
-        // Implementation contract: makeSecureRequestHelper wraps secureAxiosRequest
-        // with an onRedirect callback that re-validates the Location header hostname
-        // against allowedHosts. If the redirect target is not allowed, it throws.
-        //
-        // To simulate a redirect response, mockSecureAxios is configured to
-        // return 302 + Location on first call, then 200 on second call.
-        // The guard must intercept before the second call and throw.
-        mockSecureAxios
+        // axios returns a 302 with Location pointing outside allowedHosts.
+        // The guard must check the Location hostname before following.
+        mockAxios
             .mockResolvedValueOnce({
                 status: 302,
                 headers: { location: 'https://evil.example.com/steal' },
@@ -240,7 +227,7 @@ describe('$secureRequest — redirect allowedHosts re-check', () => {
 
     it('allows a redirect within the same allowed host', async () => {
         // Both initial and redirect target are on api.allowed.com → should succeed.
-        mockSecureAxios
+        mockAxios
             .mockResolvedValueOnce({
                 status: 301,
                 headers: { location: 'https://api.allowed.com/v2/data' },
@@ -256,12 +243,10 @@ describe('$secureRequest — redirect allowedHosts re-check', () => {
 // ── Integration: onSecretResolved callback populates resolvedSecretValues ─────
 
 describe('makeSecureRequestHelper — onSecretResolved callback (F-04, F-06 fix)', () => {
-    // Use the REAL guardRequest module for this test (unmock it).
-    // We mock only httpSecurity and utils at module level above.
-
     beforeEach(() => {
         jest.resetAllMocks()
-        mockSecureAxios.mockResolvedValue({ data: 'ok', status: 200 } as any)
+        mockCheckDenyList.mockResolvedValue(undefined)
+        mockAxios.mockResolvedValue({ data: 'ok', status: 200, headers: {} } as any)
         mockGetCred.mockResolvedValue({ token: 'placeholder-token-1234' })
     })
 
@@ -325,5 +310,86 @@ describe('makeSecureRequestHelper — onSecretResolved callback (F-04, F-06 fix)
         const redacted = realRedact(output, [secret])
         expect(redacted).not.toContain(secret)
         expect(redacted).toContain('[REDACTED]')
+    })
+})
+
+// ── onAudit callback tests ────────────────────────────────────────────────────
+
+describe('makeSecureRequestHelper — onAudit callback', () => {
+    const auditBinding = {
+        name: 'svc',
+        credentialId: 'cred-audit',
+        allowedHosts: ['api.example.com']
+    }
+
+    beforeEach(() => {
+        jest.resetAllMocks()
+        mockCheckDenyList.mockResolvedValue(undefined)
+        mockAxios.mockResolvedValue({ data: 'ok', status: 200, headers: {} } as any)
+        mockGetCred.mockResolvedValue({ token: 'tok-AUDIT-FAKE-99999' })
+    })
+
+    it('emits an allowed audit event after a successful request', async () => {
+        const events: any[] = []
+        const helper = makeSecureRequestHelper([auditBinding], fakeOptions, undefined, (e) => events.push(e))!
+
+        await helper('svc', 'https://api.example.com/data', {})
+
+        expect(events).toHaveLength(1)
+        expect(events[0].outcome).toBe('allowed')
+        expect(events[0].binding).toBe('svc')
+        expect(events[0].host).toBe('api.example.com')
+        expect(events[0].ts).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    })
+
+    it('emits a blocked audit event when initial host is not in allowedHosts', async () => {
+        const events: any[] = []
+        const helper = makeSecureRequestHelper([auditBinding], fakeOptions, undefined, (e) => events.push(e))!
+
+        try {
+            await helper('svc', 'https://evil.example.com/steal', {})
+        } catch (_) {
+            // expected
+        }
+
+        expect(events).toHaveLength(1)
+        expect(events[0].outcome).toBe('blocked')
+        expect(events[0].host).toBe('evil.example.com')
+        expect(events[0].reason).toMatch(/not in allowedHosts/)
+    })
+
+    it('emits a blocked event when redirect goes to non-allowed host', async () => {
+        const events: any[] = []
+        mockAxios
+            .mockResolvedValueOnce({ status: 302, headers: { location: 'https://evil.example.com/steal' }, data: '' } as any)
+            .mockResolvedValueOnce({ status: 200, data: 'stolen', headers: {} } as any)
+
+        const helper = makeSecureRequestHelper([auditBinding], fakeOptions, undefined, (e) => events.push(e))!
+
+        try {
+            await helper('svc', 'https://api.example.com/data', {})
+        } catch (_) {
+            // expected
+        }
+
+        expect(events).toHaveLength(1)
+        expect(events[0].outcome).toBe('blocked')
+        expect(events[0].host).toBe('evil.example.com')
+        expect(events[0].reason).toMatch(/redirect to host/)
+    })
+
+    it('audit event never contains the resolved secret value', async () => {
+        const events: any[] = []
+        const secretToken = 'tok-AUDIT-FAKE-99999'
+        mockGetCred.mockResolvedValue({ token: secretToken })
+
+        const helper = makeSecureRequestHelper([auditBinding], fakeOptions, undefined, (e) => events.push(e))!
+        await helper('svc', 'https://api.example.com/data', {})
+
+        const eventJson = JSON.stringify(events[0])
+        expect(eventJson).not.toContain(secretToken)
+        expect(events[0]).not.toHaveProperty('credentials')
+        expect(events[0]).not.toHaveProperty('token')
+        expect(events[0]).not.toHaveProperty('secret')
     })
 })
