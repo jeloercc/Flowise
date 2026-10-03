@@ -1,0 +1,36 @@
+services:
+    - type: web
+      name: zero-context-guard-flowise
+      runtime: docker
+      # Build from the repo root Dockerfile on branch zero-context-guard
+      dockerfilePath: ./Dockerfile
+      branch: zero-context-guard
+      plan: standard # 2 GB RAM — required for pnpm monorepo build
+      healthCheckPath: /api/v1/ping
+      envVars:
+          - key: PORT
+            value: '3000'
+          - key: DATABASE_PATH
+            value: /data/.flowise
+          - key: SECRETKEY_PATH
+            value: /data/.flowise
+          - key: HTTP_SECURITY_CHECK
+            value: 'true'
+          - key: DISABLE_FLOWISE_TELEMETRY
+            value: 'true'
+          # Auth secrets — generate with: openssl rand -hex 32
+          # Set these as Render Secret environment variables, NOT in this file.
+          - key: FLOWISE_USERNAME
+            sync: false # set in Render dashboard
+          - key: FLOWISE_PASSWORD
+            sync: false
+          - key: JWT_AUTH_TOKEN_SECRET
+            sync: false
+          - key: JWT_REFRESH_TOKEN_SECRET
+            sync: false
+          - key: EXPRESS_SESSION_SECRET
+            sync: false
+      disk:
+          name: flowise-data
+          mountPath: /data
+          sizeGB: 1

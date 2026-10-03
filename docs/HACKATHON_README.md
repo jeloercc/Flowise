@@ -311,4 +311,38 @@ pnpm --filter flowise-components exec jest --ci --forceExit --silent
 
 ---
 
+## 10. Live Demo
+
+|                 |                                                                                                             |
+| --------------- | ----------------------------------------------------------------------------------------------------------- |
+| **URL**         | `https://PLACEHOLDER_RENDER_URL.onrender.com` _(update after deploy)_                                       |
+| **Login**       | Username: `demo` · Password: _(share with judges only; rotate after judging)_                               |
+| **Keys**        | The live instance uses **fake API keys only** (`sk-FAKE-DEMO-0000000000`). No real secrets are stored.      |
+| **Rate limits** | The demo agent is configured with a low iteration cap (`maxIterations=3`). No real LLM billing is incurred. |
+
+### What to try
+
+1. **Show the guard:** type `show the guard` in the chat widget — the agent calls
+   `secure_echo`. The secret is resolved server-side; the tool's JavaScript sandbox
+   never sees the key value.
+
+2. **Show the contrast:** type `show unguarded` — the agent calls `unsafe_vars_dump`.
+   The tool can read `$vars` keys (because it has no `secretBindings`), but the values
+   are all fake, so nothing real is exposed.
+
+3. **Check the audit log:** in the Flowise server logs (platform → Logs tab), look for
+   `[AUDIT]` lines — one per outbound request from the guard, recording
+   `{ tool, secretName, host, decision }`. No secret values appear in the log.
+
+### Deploy it yourself
+
+See [`deploy/README.md`](../deploy/README.md) for step-by-step Render and Railway
+instructions, the `deploy/render.yaml` Blueprint, and the `deploy/.env.example`
+template. Import `demo/chatflow-zero-context-guard.json` after first login.
+
+> Deployment checklist (auth enabled, no real keys, billing limits, password rotation):
+> [`docs/DEPLOY_CHECKLIST.md`](DEPLOY_CHECKLIST.md)
+
+---
+
 _Branch: `zero-context-guard` · Latest commit: `c2e3d6c0` · IBM Bob Hackathon 2025 · Theme 2: Modernize What Matters_

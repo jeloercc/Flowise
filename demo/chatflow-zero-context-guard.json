@@ -1,0 +1,113 @@
+{
+    "nodes": [
+        {
+            "id": "customTool_secured_1",
+            "position": { "x": 100, "y": 200 },
+            "type": "customNode",
+            "data": {
+                "id": "customTool_secured_1",
+                "label": "SecureTool (guard ON)",
+                "version": 1,
+                "name": "customTool",
+                "type": "CustomTool",
+                "baseClasses": ["DynamicStructuredTool", "StructuredTool", "Tool"],
+                "category": "Tools",
+                "description": "A Custom Tool protected by the Zero-Context Guard. $vars is absent; the secret is accessed only via $secureRequest.",
+                "inputs": {
+                    "name": "secure_echo",
+                    "description": "Call the public httpbin echo endpoint using a protected fake API key. The guard injects the Authorization header; the sandbox never sees the key value.",
+                    "schema": "z.object({ message: z.string().describe('A short message to echo') })",
+                    "code": "// $vars is NOT in scope — the Zero-Context Guard removed it.\n// The host process injects the Authorization header from the stored credential.\nconst url = `https://httpbin.org/get?msg=${encodeURIComponent(message)}`;\nconst response = await $secureRequest('demo-api', url, { method: 'GET' });\nreturn response;",
+                    "secretBindings": "[{\"name\":\"demo-api\",\"credentialId\":\"PLACEHOLDER_CREDENTIAL_ID\",\"allowedHosts\":[\"httpbin.org\"]}]"
+                },
+                "outputAnchors": [
+                    { "id": "customTool_secured_1-output-0", "name": "output", "label": "CustomTool", "type": "DynamicStructuredTool" }
+                ],
+                "selected": false
+            }
+        },
+        {
+            "id": "customTool_unguarded_1",
+            "position": { "x": 500, "y": 200 },
+            "type": "customNode",
+            "data": {
+                "id": "customTool_unguarded_1",
+                "label": "UnsecuredTool (guard OFF)",
+                "version": 1,
+                "name": "customTool",
+                "type": "CustomTool",
+                "baseClasses": ["DynamicStructuredTool", "StructuredTool", "Tool"],
+                "category": "Tools",
+                "description": "A Custom Tool WITHOUT secret bindings. It attempts to read $vars to illustrate what an unguarded tool can access.",
+                "inputs": {
+                    "name": "unsafe_vars_dump",
+                    "description": "Attempt to dump the $vars object. On a guarded tool this would not be possible because $vars would be absent.",
+                    "schema": "z.object({ dummy: z.string().optional().describe('Unused') })",
+                    "code": "// No secretBindings declared — $vars is present (legacy behaviour preserved).\n// In a real attack, this would exfiltrate all workspace secrets.\n// Here the workspace contains only a FAKE key so there is nothing real to leak.\nconst keys = typeof $vars !== 'undefined' ? Object.keys($vars) : [];\nreturn `$vars is present. Keys visible to tool: ${JSON.stringify(keys)}. (All values are fake.)`;"
+                },
+                "outputAnchors": [
+                    { "id": "customTool_unguarded_1-output-0", "name": "output", "label": "CustomTool", "type": "DynamicStructuredTool" }
+                ],
+                "selected": false
+            }
+        },
+        {
+            "id": "toolAgent_1",
+            "position": { "x": 300, "y": 500 },
+            "type": "customNode",
+            "data": {
+                "id": "toolAgent_1",
+                "label": "Tool Agent",
+                "version": 2,
+                "name": "toolAgent",
+                "type": "ToolAgentFlow",
+                "baseClasses": ["ToolAgentFlow"],
+                "category": "Agents",
+                "description": "Demo agent — call the SecureTool to show the guard working, or the UnsecuredTool to show the contrast.",
+                "inputs": {
+                    "tools": ["{{customTool_secured_1.data.instance}}", "{{customTool_unguarded_1.data.instance}}"],
+                    "systemMessage": "You are a demo assistant for the Zero-Context Guard hackathon project.\n\nYou have two tools:\n1. secure_echo — protected by the Zero-Context Guard. The sandbox never sees the API key.\n2. unsafe_vars_dump — legacy tool with no bindings. It can see $vars keys (all fake here).\n\nWhen the user asks to 'show the guard', call secure_echo.\nWhen the user asks to 'show the contrast' or 'show unguarded', call unsafe_vars_dump.\nExplain what happened in plain language.",
+                    "maxIterations": 3
+                },
+                "inputAnchors": [
+                    { "id": "toolAgent_1-input-tools", "name": "tools", "label": "Tools", "type": "Tool", "list": true },
+                    { "id": "toolAgent_1-input-model", "name": "model", "label": "Chat Model", "type": "BaseChatModel" }
+                ],
+                "outputAnchors": [{ "id": "toolAgent_1-output-0", "name": "output", "label": "ToolAgentFlow", "type": "ToolAgentFlow" }],
+                "selected": false
+            }
+        }
+    ],
+    "edges": [
+        {
+            "id": "edge-secured-to-agent",
+            "source": "customTool_secured_1",
+            "sourceHandle": "customTool_secured_1-output-0",
+            "target": "toolAgent_1",
+            "targetHandle": "toolAgent_1-input-tools",
+            "type": "buttonedge",
+            "data": {}
+        },
+        {
+            "id": "edge-unguarded-to-agent",
+            "source": "customTool_unguarded_1",
+            "sourceHandle": "customTool_unguarded_1-output-0",
+            "target": "toolAgent_1",
+            "targetHandle": "toolAgent_1-input-tools",
+            "type": "buttonedge",
+            "data": {}
+        }
+    ],
+    "chatflow": {
+        "name": "Zero-Context Guard Demo",
+        "description": "IBM Bob Hackathon — Theme 2. Demonstrates the Zero-Context Guard contrast: one guarded tool (secret injected server-side, $vars absent) versus one unguarded tool ($vars present). All credential values are fake.",
+        "deployed": false,
+        "isPublic": false,
+        "apikeyid": ""
+    },
+    "_meta": {
+        "exportedAt": "2025-07-30T00:00:00.000Z",
+        "flowise": "3.1.4-zero-context-guard",
+        "note": "FAKE credentials only. The credentialId 'PLACEHOLDER_CREDENTIAL_ID' must be replaced after import. See deploy/README.md."
+    }
+}
