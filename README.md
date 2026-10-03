@@ -2,17 +2,15 @@
 
 ## IBM Bob Hackathon 2025 — Theme 2: Modernize What Matters
 
-> Flowise is end-of-life and ships with a critical class of vulnerabilities: every Custom
-> Tool executed by an LLM receives raw `$vars` — workspace secrets, API keys, and
-> environment variables — in plain text inside the sandbox. One prompt injection is all an
-> attacker needs to exfiltrate them. We modernized this with a **Zero-Context Guard**:
-> credentials are resolved server-side and injected only through `$secureRequest`, a
-> host-allowlisted proxy wrapping the existing SSRF deny list. A redaction layer strips
-> static token patterns (OpenAI, GitHub, Slack, Google, Bearer) and resolved credential
-> values from Custom Tool outputs and errors before they reach the LLM, SSE stream, or
-> server logs. Result: 3 findings fully closed, 4 closed for tools with secret bindings,
-> 2 partially mitigated, 1 not yet closed (F-10 tracing), 46 new tests, zero breaking
-> changes, no new dependencies.
+> Flowise is end-of-life and ships critical vulnerabilities: every Custom Tool
+> executed by an LLM receives raw `$vars` — workspace secrets and API keys — in plain
+> text. One prompt injection exfiltrates them. We added a **Zero-Context Guard**:
+> credentials resolve server-side, reaching the sandbox only through `$secureRequest`,
+> a host-allowlisted proxy. Resolved values and static token patterns are redacted from
+> outputs and errors before reaching the LLM. Redirect safety: Authorization is stripped
+> on cross-host hops. DNS-rebinding protection: the validated IP is pinned into the
+> connection. Result: 10 audit findings addressed, 64 new tests, zero breaking changes,
+> no new dependencies.
 
 ---
 
@@ -82,8 +80,10 @@ Sandbox code calls:  $secureRequest('github', 'https://api.github.com/user', {})
   → closure executes IN THE HOST PROCESS:
       1. getCredentialData('cred-uuid-…')   → raw token (never touches sandbox)
       2. hostname check: 'api.github.com' ∈ allowedHosts ✓
-      3. secureAxiosRequest({url, headers: {Authorization: 'Bearer <token>'}})
-           ↳ SSRF deny list enforced on every redirect hop  [httpSecurity.ts]
+      3. secureAxiosSingleHop({url, headers: {Authorization: 'Bearer <token>'}})
+           ↳ DNS resolved once → IP validated against SSRF deny list → IP pinned
+             into http.Agent (eliminating DNS-rebinding TOCTOU window)
+           ↳ allowedHosts re-checked on every redirect hop  [guardRequest.ts]
       4. returns clean response body string to sandbox
 ```
 
@@ -147,7 +147,7 @@ already replaced the token with `[REDACTED]`.
 | --- | ---------------------------------------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------- |
 | 1   | Sandbox scope (Custom Tool)                                | `$vars` with all secrets in NodeVM scope                            | `$vars` absent when `secretBindings` declared; `$secureRequest` injected                                    | F-02       | ✅ Closed (requires secretBindings)   |
 | 2   | E2B remote VM                                              | Full `$vars` serialised and sent to e2b.dev                         | E2B disabled for tools with secret bindings                                                                 | F-01       | ✅ Closed (requires secretBindings)   |
-| 3   | SSRF in E2B sandbox                                        | No deny-list; sandbox used native `fetch` freely                    | E2B blocked; only `secureAxiosRequest` path available for binding tools                                     | F-05       | ✅ Closed (requires secretBindings)   |
+| 3   | SSRF in E2B sandbox                                        | No deny-list; sandbox used native `fetch` freely                    | E2B blocked; only `secureAxiosSingleHop` path available for binding tools                                   | F-05       | ✅ Closed (requires secretBindings)   |
 | 4   | Runtime env vars in `$vars`                                | Any `process.env` key reachable via `runtime` variable              | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `FLOWISE_`, etc. globally                              | F-03       | ✅ Closed (global)                    |
 | 5   | Tool output to LLM (binding tools)                         | Raw output returned as ToolMessage                                  | `redact(result, resolvedSecretValues)` in `_call()` — both static patterns and resolved values              | F-04       | ✅ Closed (requires secretBindings)   |
 | 6   | Error messages (binding tools)                             | Execution error could embed raw secret values                       | `redact(error, resolvedSecretValues)` before re-throw — both static patterns and resolved values            | F-06       | ✅ Closed (requires secretBindings)   |
@@ -155,17 +155,23 @@ already replaced the token with `[REDACTED]`.
 | 8   | Server logs at verbose level                               | Raw output at `logger.verbose` when `DEBUG=true`                    | `redact(output, [])` in `onToolEnd` / `onToolError` — static patterns only                                  | F-08       | ⚠️ Partial (static patterns only)     |
 | 9   | Outbound HTTP auth (Custom Tool)                           | Sandbox received raw token values; injected them in `fetch` headers | Auth header injected by host process; sandbox never receives token                                          | F-05       | ✅ Closed (requires secretBindings)   |
 | 10  | Redirect cross-host credential forwarding                  | Authorization/Cookie forwarded on any redirect, even cross-origin   | Sensitive headers stripped when redirect changes hostname; `allowedHosts` re-checked per hop                | (new)      | ✅ Closed                             |
-| 11  | Tracing providers (all 7 listed)                           | Received full unredacted output via LangChain callback chain        | Protected by static-pattern redaction in `_call()` only; no per-provider wrapper; custom secrets still leak | F-10       | ⚠️ Not closed — see Known Limitations |
-| 12  | `$vars` in LLMNode / ConditionAgent / Condition / ToolNode | `$vars` with sensitive runtime vars in scope                        | Worst-case names blocked by denylist; full `$vars` removal deferred                                         | F-07       | ⚠️ Partial (denylist only)            |
-| 13  | `$vars` in ChatPromptTemplate                              | `$vars` in scope; sensitive key names reachable                     | Worst-case names blocked by denylist; full removal deferred                                                 | F-09       | ⚠️ Partial (denylist only)            |
+| 11  | DNS-rebinding TOCTOU window                                | `checkDenyList` + `axios` resolved hostname twice; IP could change  | `secureAxiosSingleHop` pins validated IP into `http.Agent`; DNS resolved once per hop                       | (new)      | ✅ Closed                             |
+| 12  | Resolved-secret redaction                                  | `redact()` called with `[]`; custom secrets not caught              | `onSecretResolved` callback populates `resolvedSecretValues`; real values passed to `redact()`              | F-04, F-06 | ✅ Closed (requires secretBindings)   |
+| 13  | Tracing providers (all 7 listed)                           | Received full unredacted output via LangChain callback chain        | Protected by static-pattern redaction in `_call()` only; no per-provider wrapper; custom secrets still leak | F-10       | ⚠️ Not closed — see Known Limitations |
+| 14  | `$vars` in LLMNode / ConditionAgent / Condition / ToolNode | `$vars` with sensitive runtime vars in scope                        | Worst-case names blocked by denylist; full `$vars` removal deferred                                         | F-07       | ⚠️ Partial (denylist only)            |
+| 15  | `$vars` in ChatPromptTemplate                              | `$vars` in scope; sensitive key names reachable                     | Worst-case names blocked by denylist; full removal deferred                                                 | F-09       | ⚠️ Partial (denylist only)            |
+
+### Upstream bug fixed
+
+`createPinnedAgent` in the upstream Flowise codebase (confirmed against `upstream/main`) used the scalar callback form `cb(null, address, family)` in the custom `lookup` function. Node's `http.Agent` calls custom `lookup` functions with `{ all: true }` when requesting all addresses, at which point the callback contract changes to the array form `cb(null, [{address, family}])`. Passing scalars in that case causes Node's internals to call `ipaddr.parse(undefined)` → `"Invalid IP address: undefined"`. This made `secureAxiosRequest` fail for any URL with a hostname (not a raw IP literal). Observed on Node v24.11.0; the `{ all: true }` behavior has been present since at least Node v12, so it likely affects all Node versions in the Flowise supported range (≥20).
+
+Fix: [`httpSecurity.ts`](packages/components/src/httpSecurity.ts) — `createPinnedAgent` now checks `opts.all` and returns the array form when required. Covered by 4 integration tests in [`httpSecurity.pinnedAgent.test.ts`](packages/components/src/httpSecurity.pinnedAgent.test.ts) with real TCP servers.
 
 ### What did not change
 
 -   Any Custom Tool with **no** `secretBindings` field behaves identically to before.
 -   All 910 pre-existing tests pass without modification.
 -   Zero new runtime npm dependencies.
--   The SSRF deny list, NodeVM `axios`/`node-fetch` wrappers, and `secureAxiosRequest`
-    are unchanged and continue to protect all tool types.
 -   All node types other than `CustomTool` are unmodified.
 
 ---
@@ -181,6 +187,30 @@ The following gaps are documented honestly. They are deferred to a future iterat
 | **Secrets < 8 chars not redacted**      | F-04, F-06                   | `guardRedact.ts` sets `MIN_SECRET_LENGTH = 8` to avoid false positives. Short credential values are not redacted.                                                                                                                                                                                                                                                                                                                                   |
 | **No base64 / URL-encoded variants**    | F-04, F-06                   | Redaction operates on plaintext. A secret value that has been base64-encoded or percent-encoded before appearing in output will not be caught.                                                                                                                                                                                                                                                                                                      |
 | **Legacy tools (no secretBindings)**    | F-01, F-02, F-04, F-05, F-06 | All Guard protections for secret isolation and resolved-secret redaction require the admin to declare `secretBindings`. Tools that do not declare bindings continue to receive `$vars` and are not protected by the Guard's secret isolation layer.                                                                                                                                                                                                 |
+
+---
+
+## Run the Demo
+
+No server, no credentials, no setup — just Node ≥ 20 and a cloned repo.
+
+```bash
+# Show the unguarded attack: $vars exfiltration + Authorization forwarded on redirect
+bash demo/before.sh
+# Expected: runs in < 40 s; prints ⚠️ for each demonstrated leak; exits 0
+
+# Show all four defences live against real TCP servers
+bash demo/after.sh
+# Expected: runs in < 40 s; prints ✅ for each defence; exits 0
+#   Defence 1: $vars absent; resolved values redacted from output
+#   Defence 2a: allowedHosts blocks initial call to non-allowed host
+#   Defence 2b: live redirect (localhost:4001 → 127.0.0.1:4002) blocked at hop 1
+#   Defence 3: cross-host redirect strips Authorization; same-host keeps it
+```
+
+Both scripts set `HTTP_SECURITY_CHECK=false` internally (loopback allowed inside the demo
+process only) and enforce a 30-second hard timeout. After they exit, no processes linger:
+`pgrep -f "run-after|run-before"` returns nothing.
 
 ---
 
@@ -219,24 +249,26 @@ implementation began.
 Bob implemented the guard test-first, running `jest` after every subtask:
 
 1. **`src/guardRedact.ts`** — 20 tests written first. Real bug found and fixed mid-cycle: a negative lookahead was needed to prevent the Bearer pattern from re-matching `Bearer [REDACTED]` after a resolved-secret pass.
-2. **`src/guardRequest.ts`** — 13 tests written first, including subdomain bypass rejection, empty allowlist guard, and explicit checks that `credentialId` and the resolved secret never appear in error messages.
-3. **`src/utils.ts`** — `BLOCKED_ENV_KEY_PATTERNS`, `secureRequestHelper` param, `disableE2B` flag. Ran 54 existing `utils.test.ts` tests — all passed.
-4. **`core.ts` + `CustomTool.ts`** — `secretBindings`, `setSecretBindings()`, `setExecutionOptions()`, wiring, `redact()` on outputs and errors.
+2. **`src/guardRequest.ts`** — 13 initial tests. Additional tests added after self-review: redirect re-check, cross-host header stripping, `onSecretResolved`, `onAudit` callbacks. Final count: 25 tests.
+3. **`src/utils.ts`** — `BLOCKED_ENV_KEY_PATTERNS`, `secureRequestHelper` param, `disableE2B` flag.
+4. **`core.ts` + `CustomTool.ts`** — `secretBindings`, `setSecretBindings()`, `setExecutionOptions()`, wiring, `redact()` on outputs and errors. 6 new tests in `core.test.ts`.
 5. **`handler.ts`** — `redact()` in all four callback methods.
-6. Full suite: **943 tests, 0 failures, 22 suites**. Pre-commit hooks (prettier, eslint, lint-staged) passed automatically. Committed as `8c485a9d`.
+6. **`httpSecurity.ts`** — cross-host redirect strips Authorization/Cookie; `secureAxiosSingleHop` closes DNS-rebinding TOCTOU window; upstream `createPinnedAgent` lookup bug fixed. 9 new tests in `httpSecurity.test.ts`, 4 in `httpSecurity.pinnedAgent.test.ts`.
+7. Full suite: **974 tests, 0 failures, 24 suites** (baseline: 910 tests, 20 suites). Pre-commit hooks (prettier, eslint, lint-staged) pass automatically.
 
 ### Measurable Bob contribution
 
-| Activity                                              | Bob's role                                               | Human role                |
-| ----------------------------------------------------- | -------------------------------------------------------- | ------------------------- |
-| Codebase traversal (4 source files, ~2000 lines read) | Read all files; cited every claim                        | None required             |
-| Audit table (10 findings, 5 disproved)                | Authored [`docs/AUDIT.md`](docs/AUDIT.md)                | Reviewed                  |
-| Architecture design                                   | Authored [`docs/DESIGN.md`](docs/DESIGN.md)              | Signed off on 3 decisions |
-| TDD implementation                                    | Wrote tests first, then implementations                  | None                      |
-| Bug discovery                                         | Found Bearer double-redaction bug during red-green cycle | None                      |
-| Test validation                                       | Ran `jest` after every subtask                           | None                      |
-| Commit authorship                                     | Staged, wrote commit message, committed                  | None                      |
-| Accuracy audit                                        | Verified every README claim against AUDIT.md and source  | None                      |
+| Activity                                              | Bob's role                                                                         | Human role                |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------- |
+| Codebase traversal (4 source files, ~2000 lines read) | Read all files; cited every claim                                                  | None required             |
+| Audit table (10 findings, 5 disproved)                | Authored [`docs/AUDIT.md`](docs/AUDIT.md)                                          | Reviewed                  |
+| Architecture design                                   | Authored [`docs/DESIGN.md`](docs/DESIGN.md)                                        | Signed off on 3 decisions |
+| TDD implementation                                    | Wrote tests first, then implementations                                            | None                      |
+| Bug discovery (3)                                     | Bearer double-redaction; DNS-rebinding TOCTOU; upstream `createPinnedAgent` lookup | None                      |
+| Self-review                                           | Authored [`docs/REVIEW.md`](docs/REVIEW.md); 9 issues found and fixed              | None                      |
+| Test validation                                       | Ran `jest` after every subtask                                                     | None                      |
+| Commit authorship                                     | Staged, wrote commit messages, committed                                           | None                      |
+| Accuracy audit                                        | Verified every README claim against AUDIT.md and source                            | None                      |
 
 Every claim in this document is backed by a file in this repository. No numbers were
 invented. See [`docs/BOB_LOG.md`](docs/BOB_LOG.md) for the per-session log.
@@ -248,27 +280,35 @@ invented. See [`docs/BOB_LOG.md`](docs/BOB_LOG.md) for the per-session log.
 ```
 packages/components/
   src/
-    guardRedact.ts          ← NEW: pure redact() function (static token patterns + resolved secrets)
-    guardRedact.test.ts     ← NEW: 20 tests
-    guardRequest.ts         ← NEW: makeSecureRequestHelper factory + onSecretResolved callback
-    guardRequest.test.ts    ← NEW: 20 tests (incl. redirect + onSecretResolved)
-    httpSecurity.ts         ← MODIFIED: cross-host redirect strips sensitive headers
-    httpSecurity.test.ts    ← MODIFIED: 9 new redirect header-stripping tests
-    utils.ts                ← MODIFIED: BLOCKED_ENV_KEY_PATTERNS, secureRequestHelper param, disableE2B flag
-    handler.ts              ← MODIFIED: redact() in 4 callback methods
+    guardRedact.ts               ← NEW: pure redact() function (static patterns + resolved secrets)
+    guardRedact.test.ts          ← NEW: 20 tests
+    guardRequest.ts              ← NEW: makeSecureRequestHelper factory + redirect loop + audit events
+    guardRequest.test.ts         ← NEW: 25 tests (redirect, header-strip, onSecretResolved, onAudit)
+    httpSecurity.ts              ← MODIFIED: secureAxiosSingleHop (DNS-pin); cross-host strip;
+                                              createPinnedAgent lookup all:true fix
+    httpSecurity.test.ts         ← MODIFIED: +9 redirect header-stripping tests
+    httpSecurity.pinnedAgent.test.ts ← NEW: 4 integration tests (real TCP servers)
+    utils.ts                     ← MODIFIED: BLOCKED_ENV_KEY_PATTERNS, secureRequestHelper param,
+                                              disableE2B flag
+    handler.ts                   ← MODIFIED: redact() in 4 callback methods
   nodes/tools/CustomTool/
-    core.ts                 ← MODIFIED: secretBindings, $secureRequest wiring, resolvedSecretValues collection
-    core.test.ts            ← NEW: 6 tests for resolved-secret redaction
-    CustomTool.ts           ← MODIFIED: parse + attach secretBindings from nodeData.inputs
+    core.ts                      ← MODIFIED: secretBindings, $secureRequest wiring, resolvedSecretValues
+    core.test.ts                 ← NEW: 6 tests for resolved-secret redaction
+    CustomTool.ts                ← MODIFIED: parse + attach secretBindings from nodeData.inputs
 
 docs/
-  BASELINE.md               ← pre-Guard and post-Guard test snapshots
-  AUDIT.md                  ← 10 confirmed findings, 5 disproved
-  DESIGN.md                 ← full technical specification
-  REVIEW.md                 ← self-review findings and fix list
-  BOB_LOG.md                ← per-session IBM Bob usage log
-  HACKATHON_README.md       ← original submission README
-  FLOWISE_README.md         ← original Flowise README (preserved)
+  BASELINE.md                    ← pre-Guard and post-Guard test snapshots
+  AUDIT.md                       ← 10 confirmed findings, 5 disproved
+  DESIGN.md                      ← full technical specification
+  REVIEW.md                      ← self-review findings and fix list (9 issues, all addressed)
+  BOB_LOG.md                     ← per-session IBM Bob usage log
+  HACKATHON_README.md            ← submission README
+  FLOWISE_README.md              ← original Flowise README (preserved)
+
+demo/
+  before.sh / run-before.ts      ← unguarded attack demo (< 40 s, exits clean)
+  after.sh  / run-after.ts       ← guarded defence demo (< 40 s, exits clean)
+  mock-servers.js                ← two-server redirect harness
 ```
 
 ## Running the Tests
@@ -276,12 +316,12 @@ docs/
 ```bash
 pnpm install
 pnpm --filter flowise-components exec jest --ci --forceExit --silent
-# Expected: Test Suites: 25 passed  Tests: ~989 passed  Time: ~115 s
+# Expected: Test Suites: 24 passed  Tests: 974 passed  Time: ~120 s
 ```
 
 ---
 
-_Branch: `zero-context-guard` · Commits: `8c485a9d` → `4cff856f` → `5242be3c` · IBM Bob Hackathon 2025 · Theme 2: Modernize What Matters_
+_Branch: `zero-context-guard` · Commits: `8c485a9d` → `4cff856f` → `5242be3c` → `8c355358` → `baeef186` · IBM Bob Hackathon 2025 · Theme 2: Modernize What Matters_
 
 ---
 
