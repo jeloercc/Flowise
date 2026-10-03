@@ -8,15 +8,20 @@
  *   1. The resolved credential value is NEVER placed in the sandbox scope.
  *   2. `allowedHosts` is checked against the lowercased URL hostname with
  *      exact-match semantics — no substring or prefix matching.
- *   3. The actual HTTP call goes through `secureAxiosRequest`, which enforces
+ *   3. `allowedHosts` is re-checked on EVERY redirect hop, not only the
+ *      initial URL.  A redirect to a non-allowed host throws immediately.
+ *   4. The actual HTTP call goes through `secureAxiosRequest`, which enforces
  *      the SSRF deny list and validates every redirect hop.
- *   4. Neither the credentialId nor the resolved secret value appears in any
+ *   5. Neither the credentialId nor the resolved secret value appears in any
  *      thrown error message.
  */
 
 import { ICommonObject } from './Interface'
 import { secureAxiosRequest } from './httpSecurity'
 import { getCredentialData } from './utils'
+
+/** Maximum number of redirects the guard will follow. */
+const MAX_GUARD_REDIRECTS = 5
 
 /** Admin-declared binding between a name alias and a stored credential. */
 export interface SecretBinding {
@@ -145,7 +150,7 @@ export function makeSecureRequestHelper(
             throw new Error(`$secureRequest: unknown binding "${name}"`)
         }
 
-        // 2. Check allowedHosts with exact hostname match.
+        // 2. Check allowedHosts on the initial URL with exact hostname match.
         const hostname = safeHostname(url)
         const allowed = binding.allowedHosts.map((h) => h.toLowerCase())
         if (!allowed.includes(hostname)) {
@@ -165,16 +170,63 @@ export function makeSecureRequestHelper(
             }
         }
 
-        // 5. Execute through secureAxiosRequest (enforces SSRF deny list + redirect checks).
-        const response = await secureAxiosRequest({
-            url,
-            method: requestOptions.method ?? 'GET',
-            data: requestOptions.data ?? requestOptions.body,
-            headers: interpolated
-        })
+        // 5. Execute through secureAxiosRequest with maxRedirects=0 so we can
+        //    re-check allowedHosts on every redirect hop before following it.
+        let currentUrl = url
+        let currentHeaders = interpolated
+        let method = requestOptions.method ?? 'GET'
+        let data: unknown = requestOptions.data ?? requestOptions.body
+        let redirects = 0
 
-        // 6. Serialize response data to string.
-        if (typeof response.data === 'string') return response.data
-        return JSON.stringify(response.data)
+        while (redirects <= MAX_GUARD_REDIRECTS) {
+            const response = await secureAxiosRequest(
+                {
+                    url: currentUrl,
+                    method,
+                    data,
+                    headers: currentHeaders
+                },
+                0 /* maxRedirects — guard handles redirect loop itself */
+            )
+
+            // Not a redirect — return the final response.
+            if (response.status < 300 || response.status >= 400) {
+                if (typeof response.data === 'string') return response.data
+                return JSON.stringify(response.data)
+            }
+
+            const location = (response.headers as any)?.location
+            if (!location) {
+                // Redirect with no Location header — return as-is.
+                if (typeof response.data === 'string') return response.data
+                return JSON.stringify(response.data)
+            }
+
+            redirects++
+            if (redirects > MAX_GUARD_REDIRECTS) {
+                throw new Error('$secureRequest: too many redirects')
+            }
+
+            const nextUrl = new URL(location, currentUrl).toString()
+            const nextHostname = safeHostname(nextUrl)
+
+            // Re-check allowedHosts for every redirect destination.
+            if (!allowed.includes(nextHostname)) {
+                throw new Error(`$secureRequest: redirect to host "${nextHostname}" is not in allowedHosts for binding "${name}"`)
+            }
+
+            currentUrl = nextUrl
+
+            // Honour standard redirect method semantics.
+            if (
+                response.status === 303 ||
+                (response.status !== 307 && response.status !== 308 && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase()))
+            ) {
+                method = 'GET'
+                data = undefined
+            }
+        }
+
+        throw new Error('$secureRequest: too many redirects')
     }
 }

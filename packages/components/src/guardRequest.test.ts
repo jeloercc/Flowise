@@ -63,7 +63,8 @@ describe('makeSecureRequestHelper', () => {
                 expect.objectContaining({
                     url: 'https://api.github.com/repos/test',
                     method: 'GET'
-                })
+                }),
+                0 // guard manages redirects itself, passes maxRedirects=0 to secureAxiosRequest
             )
             expect(result).toBe('{"ok":true}')
         })
@@ -77,7 +78,8 @@ describe('makeSecureRequestHelper', () => {
                     headers: expect.objectContaining({
                         Authorization: 'Bearer ghp_FAKEFAKEFAKEFAKEFAKE1234567890'
                     })
-                })
+                }),
+                0 // guard manages redirects itself
             )
         })
 
@@ -167,5 +169,81 @@ describe('makeSecureRequestHelper', () => {
             const helper = makeSecureRequestHelper([binding], fakeOptions)!
             await expect(helper('github', 'https://evil.api.github.com/steal', {})).rejects.toThrow(/not in allowedHosts/i)
         })
+    })
+})
+
+describe('$secureRequest — redirect allowedHosts re-check', () => {
+    /**
+     * These tests verify that when secureAxiosRequest follows a redirect,
+     * guardRequest re-checks allowedHosts against the redirect destination.
+     * A redirect to a host NOT in allowedHosts must throw even if the
+     * original URL was allowed.
+     *
+     * We simulate redirect behaviour by making mockSecureAxios throw the
+     * error that the implementation is expected to throw when it re-validates
+     * the redirect target URL against allowedHosts.
+     *
+     * For the positive case (redirect within allowed host), we verify the
+     * request completes normally when secureAxiosRequest is called with the
+     * final allowed URL.
+     */
+
+    const redirectBinding: SecretBinding = {
+        name: 'api',
+        credentialId: 'cred-api-redir',
+        allowedHosts: ['api.allowed.com']
+    }
+
+    beforeEach(() => {
+        jest.clearAllMocks()
+        mockGetCred.mockResolvedValue({ token: 'tok-FAKE-REDIRECT-12345' })
+        mockSecureAxios.mockResolvedValue({ data: 'ok', status: 200 } as any)
+    })
+
+    it('allows request when initial URL is in allowedHosts', async () => {
+        const helper = makeSecureRequestHelper([redirectBinding], fakeOptions)!
+        await expect(helper('api', 'https://api.allowed.com/data', {})).resolves.toBe('ok')
+    })
+
+    it('blocks redirect to a host not in allowedHosts', async () => {
+        // Simulate: secureAxiosRequest follows a redirect to evil.example.com.
+        // The guard must re-check the redirect destination against allowedHosts
+        // before calling secureAxiosRequest (or by intercepting the result).
+        // We test the guard's own pre-call check by having it receive a
+        // redirect response whose Location header points outside allowedHosts.
+        //
+        // Implementation contract: makeSecureRequestHelper wraps secureAxiosRequest
+        // with an onRedirect callback that re-validates the Location header hostname
+        // against allowedHosts. If the redirect target is not allowed, it throws.
+        //
+        // To simulate a redirect response, mockSecureAxios is configured to
+        // return 302 + Location on first call, then 200 on second call.
+        // The guard must intercept before the second call and throw.
+        mockSecureAxios
+            .mockResolvedValueOnce({
+                status: 302,
+                headers: { location: 'https://evil.example.com/steal' },
+                data: ''
+            } as any)
+            .mockResolvedValueOnce({ status: 200, data: 'stolen', headers: {} } as any)
+
+        const helper = makeSecureRequestHelper([redirectBinding], fakeOptions)!
+        await expect(helper('api', 'https://api.allowed.com/data', {})).rejects.toThrow(
+            /not in allowedHosts|redirect.*not allowed|blocked/i
+        )
+    })
+
+    it('allows a redirect within the same allowed host', async () => {
+        // Both initial and redirect target are on api.allowed.com → should succeed.
+        mockSecureAxios
+            .mockResolvedValueOnce({
+                status: 301,
+                headers: { location: 'https://api.allowed.com/v2/data' },
+                data: ''
+            } as any)
+            .mockResolvedValueOnce({ status: 200, data: 'result', headers: {} } as any)
+
+        const helper = makeSecureRequestHelper([redirectBinding], fakeOptions)!
+        await expect(helper('api', 'https://api.allowed.com/data', {})).resolves.toBeDefined()
     })
 })

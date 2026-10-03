@@ -395,3 +395,217 @@ describe('isDeniedIP - SSRF Protection', () => {
         })
     })
 })
+
+// ── Redirect cross-host header-stripping tests ────────────────────────────────
+//
+// These tests verify that sensitive headers (Authorization, Cookie, X-Api-Key,
+// X-Auth-Token, X-Secret) are stripped when a redirect changes the origin
+// (host), but kept when the redirect stays on the same host.
+//
+// Both secureAxiosRequest and secureFetch are tested.
+// All DNS/network calls are fully mocked so no real network traffic is made.
+
+import { secureAxiosRequest, secureFetch } from './httpSecurity'
+
+// We need to mock the DNS resolver and axios/node-fetch so tests run offline.
+jest.mock('dns/promises', () => ({
+    lookup: jest.fn()
+}))
+
+jest.mock('axios', () => {
+    const mockAxios = jest.fn()
+    return mockAxios
+})
+
+jest.mock('node-fetch', () => {
+    const mockFetch = jest.fn()
+    return mockFetch
+})
+
+import dns from 'dns/promises'
+import axios from 'axios'
+import nodeFetch from 'node-fetch'
+
+const mockDns = dns.lookup as jest.MockedFunction<typeof dns.lookup>
+const mockAxios = axios as unknown as jest.MockedFunction<(config: any) => Promise<any>>
+const mockFetch = nodeFetch as unknown as jest.MockedFunction<(url: any, opts: any) => Promise<any>>
+
+function fakeResponse(status: number, headers: Record<string, string> = {}, data: any = 'ok') {
+    return {
+        status,
+        headers: {
+            ...headers,
+            get: (k: string) => headers[k.toLowerCase()] ?? null
+        },
+        data,
+        text: async () => (typeof data === 'string' ? data : JSON.stringify(data))
+    }
+}
+
+function setupDns(ip = '93.184.216.34') {
+    // Return a benign public IP for any hostname lookup.
+    mockDns.mockResolvedValue([{ address: ip, family: 4 }] as any)
+}
+
+describe('secureAxiosRequest — redirect header handling', () => {
+    beforeEach(() => {
+        jest.clearAllMocks()
+        setupDns()
+    })
+
+    it('keeps Authorization header on same-host redirect', async () => {
+        // First call → 302 to same host; second call → 200.
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'https://api.example.com/v2/data' }))
+            .mockResolvedValueOnce(fakeResponse(200, {}, 'data'))
+
+        await secureAxiosRequest({
+            url: 'https://api.example.com/v1/data',
+            method: 'GET',
+            headers: { Authorization: 'Bearer secret-token-1234' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Authorization']).toBe('Bearer secret-token-1234')
+    })
+
+    it('strips Authorization header on cross-host redirect', async () => {
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'https://other.example.com/page' }))
+            .mockResolvedValueOnce(fakeResponse(200, {}, 'data'))
+
+        await secureAxiosRequest({
+            url: 'https://api.example.com/v1/data',
+            method: 'GET',
+            headers: { Authorization: 'Bearer secret-token-1234' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Authorization']).toBeUndefined()
+    })
+
+    it('strips Cookie header on cross-host redirect', async () => {
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'https://other.example.com/page' }))
+            .mockResolvedValueOnce(fakeResponse(200, {}, 'data'))
+
+        await secureAxiosRequest({
+            url: 'https://api.example.com/v1/data',
+            method: 'GET',
+            headers: { Cookie: 'session=abc123' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Cookie']).toBeUndefined()
+    })
+
+    it('strips X-Api-Key header on cross-host redirect', async () => {
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'https://other.example.com/page' }))
+            .mockResolvedValueOnce(fakeResponse(200, {}, 'data'))
+
+        await secureAxiosRequest({
+            url: 'https://api.example.com/v1/data',
+            method: 'GET',
+            headers: { 'X-Api-Key': 'my-api-key-99999' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['X-Api-Key']).toBeUndefined()
+    })
+
+    it('strips X-Auth-Token header on cross-host redirect', async () => {
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'https://other.example.com/page' }))
+            .mockResolvedValueOnce(fakeResponse(200, {}, 'data'))
+
+        await secureAxiosRequest({
+            url: 'https://api.example.com/v1/data',
+            method: 'GET',
+            headers: { 'X-Auth-Token': 'auth-tok-99999' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['X-Auth-Token']).toBeUndefined()
+    })
+
+    it('keeps non-sensitive headers on cross-host redirect', async () => {
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'https://other.example.com/page' }))
+            .mockResolvedValueOnce(fakeResponse(200, {}, 'data'))
+
+        await secureAxiosRequest({
+            url: 'https://api.example.com/v1/data',
+            method: 'GET',
+            headers: { Authorization: 'Bearer tok', Accept: 'application/json', 'X-Request-Id': 'req-1' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Authorization']).toBeUndefined()
+        expect(secondCall.headers['Accept']).toBe('application/json')
+        expect(secondCall.headers['X-Request-Id']).toBe('req-1')
+    })
+})
+
+describe('secureFetch — redirect header handling', () => {
+    beforeEach(() => {
+        jest.clearAllMocks()
+        setupDns()
+    })
+
+    // node-fetch Response-like mock
+    function fetchResponse(status: number, headers: Record<string, string> = {}, body = 'ok') {
+        return {
+            status,
+            ok: status >= 200 && status < 300,
+            headers: {
+                get: (k: string) => headers[k.toLowerCase()] ?? null
+            },
+            text: async () => body
+        }
+    }
+
+    it('keeps Authorization header on same-host redirect', async () => {
+        mockFetch
+            .mockResolvedValueOnce(fetchResponse(302, { location: 'https://api.example.com/v2' }) as any)
+            .mockResolvedValueOnce(fetchResponse(200) as any)
+
+        await secureFetch('https://api.example.com/v1', {
+            headers: { Authorization: 'Bearer tok-1234' }
+        })
+
+        const secondCall = mockFetch.mock.calls[1]
+        const secondHeaders: any = secondCall[1]?.headers ?? {}
+        const authValue = typeof secondHeaders === 'object' ? secondHeaders['Authorization'] ?? secondHeaders['authorization'] : undefined
+        expect(authValue).toBe('Bearer tok-1234')
+    })
+
+    it('strips Authorization header on cross-host redirect', async () => {
+        mockFetch
+            .mockResolvedValueOnce(fetchResponse(302, { location: 'https://other.example.com/page' }) as any)
+            .mockResolvedValueOnce(fetchResponse(200) as any)
+
+        await secureFetch('https://api.example.com/v1', {
+            headers: { Authorization: 'Bearer secret-9999' }
+        })
+
+        const secondCall = mockFetch.mock.calls[1]
+        const secondHeaders: any = secondCall[1]?.headers ?? {}
+        const authValue = typeof secondHeaders === 'object' ? secondHeaders['Authorization'] ?? secondHeaders['authorization'] : undefined
+        expect(authValue).toBeUndefined()
+    })
+
+    it('strips Cookie header on cross-host redirect', async () => {
+        mockFetch
+            .mockResolvedValueOnce(fetchResponse(302, { location: 'https://other.example.com/page' }) as any)
+            .mockResolvedValueOnce(fetchResponse(200) as any)
+
+        await secureFetch('https://api.example.com/v1', {
+            headers: { Cookie: 'session=xyz' }
+        })
+
+        const secondCall = mockFetch.mock.calls[1]
+        const secondHeaders: any = secondCall[1]?.headers ?? {}
+        expect(secondHeaders['Cookie'] ?? secondHeaders['cookie']).toBeUndefined()
+    })
+})

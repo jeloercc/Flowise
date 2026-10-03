@@ -146,6 +146,29 @@ export interface SecureRequestAgentOptions {
 }
 
 /**
+ * Pattern for header names that carry credentials and must NOT be forwarded
+ * when a redirect changes the origin (host).
+ * Matches: Authorization, Cookie, X-Api-Key, X-Auth-Token, X-Secret, etc.
+ */
+const SENSITIVE_HEADER_PATTERN = /key|token|secret|auth|cookie/i
+
+/**
+ * Returns a copy of `headers` with all sensitive credential headers removed.
+ * Used when a redirect crosses to a different hostname.
+ */
+function stripSensitiveHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+    if (!headers) return {}
+    const result: Record<string, string> = {}
+    for (const [name, value] of Object.entries(headers)) {
+        if (name.toLowerCase() === 'authorization' || name.toLowerCase() === 'cookie' || SENSITIVE_HEADER_PATTERN.test(name)) {
+            continue
+        }
+        result[name] = value
+    }
+    return result
+}
+
+/**
  * Makes a secure HTTP request that validates all URLs in redirect chains against the deny list
  * @param config - Axios request configuration (httpsAgent/httpAgent are ignored; use agentOptions for custom CA)
  * @param maxRedirects - Maximum number of redirects to follow (default: 5)
@@ -164,6 +187,9 @@ export async function secureAxiosRequest(
     }
 
     let redirects = 0
+    // Track the origin hostname so we can detect cross-origin redirects.
+    const originHostname = new URL(currentUrl).hostname.toLowerCase()
+
     let currentConfig: AxiosRequestConfig = {
         ...config,
         maxRedirects: 0,
@@ -205,7 +231,9 @@ export async function secureAxiosRequest(
             throw new Error('Too many redirects')
         }
 
-        currentUrl = new URL(location, currentUrl).toString()
+        const nextUrl = new URL(location, currentUrl).toString()
+        const nextHostname = new URL(nextUrl).hostname.toLowerCase()
+        currentUrl = nextUrl
 
         // For redirects, we only need to preserve certain headers and change method if needed
         if (response.status === 301 || response.status === 302 || response.status === 303) {
@@ -216,6 +244,15 @@ export async function secureAxiosRequest(
             ) {
                 currentConfig.method = 'GET'
                 delete currentConfig.data
+            }
+        }
+
+        // Cross-origin redirect: strip sensitive credential headers (F-redirect).
+        // Same-origin redirects (same hostname) keep all headers unchanged.
+        if (nextHostname !== originHostname) {
+            currentConfig = {
+                ...currentConfig,
+                headers: stripSensitiveHeaders(currentConfig.headers as Record<string, string> | undefined)
             }
         }
     }
@@ -240,6 +277,8 @@ export async function secureFetch(
 ): Promise<Response> {
     let currentUrl = url
     let redirectCount = 0
+    // Track the origin hostname so we can detect cross-origin redirects.
+    const originHostname = new URL(url).hostname.toLowerCase()
     let currentInit = { ...init, redirect: 'manual' as const } // Disable automatic redirects
 
     while (redirectCount <= maxRedirects) {
@@ -267,7 +306,9 @@ export async function secureFetch(
         }
 
         // Resolve the redirect URL (handle relative URLs)
-        currentUrl = new URL(location, currentUrl).toString()
+        const nextUrl = new URL(location, currentUrl).toString()
+        const nextHostname = new URL(nextUrl).hostname.toLowerCase()
+        currentUrl = nextUrl
 
         // Handle method changes for redirects according to HTTP specs
         if (response.status === 301 || response.status === 302 || response.status === 303) {
@@ -279,6 +320,13 @@ export async function secureFetch(
                     body: undefined
                 }
             }
+        }
+
+        // Cross-origin redirect: strip sensitive credential headers (F-redirect).
+        // Same-origin redirects (same hostname) keep all headers unchanged.
+        if (nextHostname !== originHostname) {
+            const strippedHeaders = stripSensitiveHeaders(currentInit.headers as Record<string, string> | undefined)
+            currentInit = { ...currentInit, headers: strippedHeaders }
         }
     }
 
