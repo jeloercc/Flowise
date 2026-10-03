@@ -181,8 +181,24 @@ export async function secureAxiosSingleHop(config: AxiosRequestConfig, agentOpti
 }
 
 /**
+ * Returns the lowercased origin (scheme + hostname + port) of a URL string.
+ * Used for cross-origin detection so that a same-hostname/different-port
+ * redirect is correctly treated as a different origin.
+ *
+ * Examples:
+ *   "https://api.example.com/path"  → "https://api.example.com"
+ *   "http://example.com:4001/path"  → "http://example.com:4001"
+ *   "http://example.com:4002/path"  → "http://example.com:4002"  (different!)
+ */
+function urlOrigin(url: string): string {
+    const u = new URL(url)
+    // u.origin is already scheme + hostname + port (omits default ports).
+    return u.origin.toLowerCase()
+}
+
+/**
  * Pattern for header names that carry credentials and must NOT be forwarded
- * when a redirect changes the origin (host).
+ * when a redirect changes the origin (scheme+host+port).
  * Matches: Authorization, Cookie, X-Api-Key, X-Auth-Token, X-Secret, etc.
  */
 const SENSITIVE_HEADER_PATTERN = /key|token|secret|auth|cookie/i
@@ -222,8 +238,9 @@ export async function secureAxiosRequest(
     }
 
     let redirects = 0
-    // Track the origin hostname so we can detect cross-origin redirects.
-    const originHostname = new URL(currentUrl).hostname.toLowerCase()
+    // Track the full origin (scheme+host+port) to detect any cross-origin redirect,
+    // including same-hostname/different-port and http→https.
+    const originOrigin = urlOrigin(currentUrl)
 
     let currentConfig: AxiosRequestConfig = {
         ...config,
@@ -267,7 +284,7 @@ export async function secureAxiosRequest(
         }
 
         const nextUrl = new URL(location, currentUrl).toString()
-        const nextHostname = new URL(nextUrl).hostname.toLowerCase()
+        const nextOrigin = urlOrigin(nextUrl)
         currentUrl = nextUrl
 
         // For redirects, we only need to preserve certain headers and change method if needed
@@ -282,9 +299,10 @@ export async function secureAxiosRequest(
             }
         }
 
-        // Cross-origin redirect: strip sensitive credential headers (F-redirect).
-        // Same-origin redirects (same hostname) keep all headers unchanged.
-        if (nextHostname !== originHostname) {
+        // Cross-origin redirect: strip sensitive credential headers.
+        // Compares full origin (scheme + hostname + port) so that same-hostname
+        // but different-port redirects also trigger stripping.
+        if (nextOrigin !== originOrigin) {
             currentConfig = {
                 ...currentConfig,
                 headers: stripSensitiveHeaders(currentConfig.headers as Record<string, string> | undefined)
@@ -312,8 +330,9 @@ export async function secureFetch(
 ): Promise<Response> {
     let currentUrl = url
     let redirectCount = 0
-    // Track the origin hostname so we can detect cross-origin redirects.
-    const originHostname = new URL(url).hostname.toLowerCase()
+    // Track the full origin (scheme+host+port) to detect any cross-origin redirect,
+    // including same-hostname/different-port and http→https.
+    const originOrigin = urlOrigin(currentUrl)
     let currentInit = { ...init, redirect: 'manual' as const } // Disable automatic redirects
 
     while (redirectCount <= maxRedirects) {
@@ -342,7 +361,7 @@ export async function secureFetch(
 
         // Resolve the redirect URL (handle relative URLs)
         const nextUrl = new URL(location, currentUrl).toString()
-        const nextHostname = new URL(nextUrl).hostname.toLowerCase()
+        const nextOrigin = urlOrigin(nextUrl)
         currentUrl = nextUrl
 
         // Handle method changes for redirects according to HTTP specs
@@ -357,9 +376,10 @@ export async function secureFetch(
             }
         }
 
-        // Cross-origin redirect: strip sensitive credential headers (F-redirect).
-        // Same-origin redirects (same hostname) keep all headers unchanged.
-        if (nextHostname !== originHostname) {
+        // Cross-origin redirect: strip sensitive credential headers.
+        // Compares full origin (scheme + hostname + port) so that same-hostname
+        // but different-port redirects also trigger stripping.
+        if (nextOrigin !== originOrigin) {
             const strippedHeaders = stripSensitiveHeaders(currentInit.headers as Record<string, string> | undefined)
             currentInit = { ...currentInit, headers: strippedHeaders }
         }

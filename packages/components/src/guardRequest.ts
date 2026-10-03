@@ -124,11 +124,26 @@ function interpolateHeaders(headers: Record<string, string> | undefined, credent
 
 /**
  * Extracts and lowercases the hostname from a URL string.
+ * Used for allowedHosts checks (which are hostname-only, not origin-based).
  * Throws a generic error (without the URL) if parsing fails.
  */
 function safeHostname(url: string): string {
     try {
         return new URL(url).hostname.toLowerCase()
+    } catch {
+        throw new Error('$secureRequest: invalid URL')
+    }
+}
+
+/**
+ * Returns the lowercased origin (scheme + hostname + port) of a URL.
+ * Used for sensitive-header stripping decisions so that a same-hostname
+ * but different-port redirect is treated as a different origin.
+ * Throws a generic error (without the URL) if parsing fails.
+ */
+function safeOrigin(url: string): string {
+    try {
+        return new URL(url).origin.toLowerCase()
     } catch {
         throw new Error('$secureRequest: invalid URL')
     }
@@ -224,9 +239,11 @@ export function makeSecureRequestHelper(
         //    - Returns raw AxiosResponse (including 3xx); this loop handles
         //      redirects so allowedHosts can be re-checked on every hop.
         //
-        //    originHostname is used to detect cross-host redirects so that
+        //    originOrigin is used to detect cross-origin redirects so that
         //    sensitive headers can be stripped before forwarding (invariant 5).
-        const originHostname = safeHostname(url)
+        //    Uses full origin (scheme+host+port) rather than just hostname,
+        //    so that a same-hostname/different-port redirect also triggers stripping.
+        const originOrigin = safeOrigin(url)
         let currentUrl = url
         let currentHeaders = interpolated
         let method = requestOptions.method ?? 'GET'
@@ -289,9 +306,9 @@ export function makeSecureRequestHelper(
 
             currentUrl = nextUrl
 
-            // Strip sensitive credential headers on cross-host redirects (invariant 5).
-            // Same-hostname redirects keep all headers unchanged.
-            if (nextHostname !== originHostname) {
+            // Strip sensitive credential headers on cross-origin redirects (invariant 5).
+            // Compares full origin (scheme+host+port); same-origin redirects keep all headers.
+            if (safeOrigin(nextUrl) !== originOrigin) {
                 const stripped: Record<string, string> = {}
                 const SENSITIVE = /key|token|secret|auth|cookie/i
                 for (const [k, v] of Object.entries(currentHeaders)) {

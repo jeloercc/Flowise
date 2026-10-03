@@ -4,14 +4,14 @@
  * Demonstrates the AFTER state — with the Zero-Context Guard active.
  * Every line of output comes from real code execution.
  *
- * Defence 1: $vars absent; resolved-secret redaction
+ * Defence 1:  $vars absent; resolved-secret redaction
  * Defence 2a: non-allowed host blocked on initial call
- * Defence 2b: live redirect through $secureRequest — allowedHosts:["localhost"],
- *             server A (localhost:4001) redirects to server B (127.0.0.1:4002),
- *             guard blocks at hop 1 ("127.0.0.1" ∉ ["localhost"]), B gets nothing
- * Defence 3: cross-host redirect (localhost → 127.0.0.1) strips Authorization;
- *            same-host redirect (127.0.0.1 → 127.0.0.1) keeps it — BOTH live
- * Audit event: real GuardAuditEvent objects from onAudit callback
+ * Defence 2b: live redirect — $secureRequest blocks hop to non-allowed host
+ * Defence 3:  cross-host redirect (localhost → 127.0.0.1) strips Authorization
+ * Defence 3a: same-hostname/different-port redirect also strips Authorization
+ *             (the attack from before.sh: 127.0.0.1:4001 → 127.0.0.1:4002)
+ * Defence 3b: same-origin redirect (127.0.0.1:same-port → same-port) keeps Authorization
+ * Audit event: one real GuardAuditEvent from onAudit callback (Defence 2b)
  *
  * Hard internal timeout: 30 s (process.exit(2) + "TIMEOUT" message).
  * HTTP_SECURITY_CHECK=false: documented env var that bypasses the private-IP
@@ -253,25 +253,13 @@ async function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Defence 3: cross-host redirect strips Authorization (secureAxiosRequest)
-    //            same-host redirect KEEPS it (precision)
-    //
-    // Cross-host: localhost:4001 → 302 → 127.0.0.1:4002
-    //   originHostname = "localhost"; redirectHostname = "127.0.0.1"
-    //   → Authorization stripped
-    //
-    // Same-host: 127.0.0.1:4004 → 302 → 127.0.0.1:4002
-    //   originHostname = "127.0.0.1"; redirectHostname = "127.0.0.1"
-    //   → Authorization kept
-    //
-    // Both are run LIVE against real TCP servers.
+    // Defence 3: cross-host redirect (localhost → 127.0.0.1) strips Authorization
+    //   originOrigin = "http://localhost:4006"; redirectOrigin = "http://127.0.0.1:4005"
+    //   → hostname changed → Authorization stripped
     // ─────────────────────────────────────────────────────────────────────────
-    subheader('Defence 3 — cross-host redirect strips Authorization; same-host redirect keeps it')
+    subheader('Defence 3 — cross-host redirect strips Authorization')
 
-    // D3 uses ports 4005 (server B) / 4006 (server A cross) / 4007 (server A same)
-    // so there is no port conflict with D2b's servers still open on 4001/4002.
-
-    // Server B: records which headers it receives
+    // Uses ports 4005 (server B) / 4006 (server A)
     const receivedByB: Record<string, string | string[] | undefined> = {}
     const srvB3 = createServer((req, res) => {
         Object.assign(receivedByB, req.headers)
@@ -280,20 +268,16 @@ async function main() {
     })
     await new Promise<void>((r) => srvB3.listen(4005, '127.0.0.1', r))
 
-    // Server A3 (cross-host): on all-interfaces so "localhost" resolves to it
-    // redirects to 127.0.0.1:4005
     const srvA3cross = createServer((_, res) => {
         res.writeHead(302, { location: 'http://127.0.0.1:4005/collect' })
         res.end()
     })
     await new Promise<void>((r) => srvA3cross.listen(4006, r))
 
-    // ── Cross-host: localhost:4006 → 127.0.0.1:4005 ──
     console.log('  Cross-host: http://localhost:4006 → http://127.0.0.1:4005')
     console.log(`  Request headers: Authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)}`)
     console.log()
 
-    // Clear state
     Object.keys(receivedByB).forEach((k) => delete receivedByB[k])
 
     await secureAxiosRequest({
@@ -302,7 +286,6 @@ async function main() {
         headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
     })
 
-    // Close cross-host server A (port 4006 no longer needed)
     await new Promise<void>((r) => srvA3cross.close(r))
 
     const authCross = receivedByB['authorization']
@@ -310,60 +293,103 @@ async function main() {
         fail(`Defence 3 (cross-host) — Authorization WAS forwarded to server B: ${String(authCross).slice(0, 10)}***`)
     }
     console.log('  ✅ Cross-host redirect: Authorization NOT received by server B')
-    const nonSensitiveKeys = Object.keys(receivedByB).filter(
-        (k) => !['host', 'user-agent', 'accept', 'accept-encoding', 'connection'].includes(k)
-    )
-    console.log('     Server B received non-sensitive headers:', JSON.stringify(nonSensitiveKeys))
     console.log('     authorization: (none)')
 
-    // ── Same-host: 127.0.0.1:4007 → 127.0.0.1:4005 ──
-    console.log()
-
-    const srvA3same = createServer((_, res) => {
-        res.writeHead(302, { location: 'http://127.0.0.1:4005/collect' })
-        res.end()
-    })
-    await new Promise<void>((r) => srvA3same.listen(4007, '127.0.0.1', r))
+    // ─────────────────────────────────────────────────────────────────────────
+    // Defence 3a: same-hostname / different-port redirect also strips Authorization
+    //   This EXACTLY replays the attack from before.sh:
+    //     127.0.0.1:4001 → 127.0.0.1:4002
+    //   originOrigin = "http://127.0.0.1:4001"; redirectOrigin = "http://127.0.0.1:4002"
+    //   port changes → different origin → Authorization stripped
+    //
+    //   Before this fix: only hostname was compared → Authorization was forwarded.
+    // ─────────────────────────────────────────────────────────────────────────
+    subheader('Defence 3a — same-hostname/different-port redirect also strips Authorization')
+    console.log('  (This is the attack replayed from before.sh: 127.0.0.1:4001 → 127.0.0.1:4002)')
 
     Object.keys(receivedByB).forEach((k) => delete receivedByB[k])
 
-    console.log('  Same-host: http://127.0.0.1:4007 → http://127.0.0.1:4005')
+    // Server A on 4001 redirects to server B on 4002 (reusing srvB3 on 4005 is not possible
+    // because we need 4002 for the exact before.sh attack; srvAttacker from D2b is on 4002
+    // but already closed — reuse it by creating a new one on 4002).
+    const srvB3a = createServer((req, res) => {
+        Object.assign(receivedByB, req.headers)
+        res.writeHead(200)
+        res.end('port-attack-collected')
+    })
+    await new Promise<void>((r) => srvB3a.listen(4008, '127.0.0.1', r))
+
+    const srvA3a = createServer((_, res) => {
+        res.writeHead(302, { location: 'http://127.0.0.1:4008/collect' })
+        res.end()
+    })
+    await new Promise<void>((r) => srvA3a.listen(4009, '127.0.0.1', r))
+
+    console.log()
+    console.log('  Same hostname, different port: http://127.0.0.1:4009 → http://127.0.0.1:4008')
     console.log(`  Request headers: Authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)}`)
     console.log()
 
     await secureAxiosRequest({
-        url: 'http://127.0.0.1:4007/start',
+        url: 'http://127.0.0.1:4009/start',
         method: 'GET',
         headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
     })
 
-    const authSame = receivedByB['authorization']
-    if (!authSame) {
-        fail('Defence 3 (same-host) — Authorization was stripped unexpectedly')
+    const authDiffPort = receivedByB['authorization']
+    if (authDiffPort) {
+        fail(`Defence 3a (diff-port) — Authorization WAS forwarded to server B: ${String(authDiffPort).slice(0, 10)}***`)
     }
-    console.log('  ✅ Same-host redirect: Authorization KEPT (correct — same origin)')
-    console.log(`     Server B received authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)} (value matches — not printed in full)`)
+    console.log('  ✅ Same-hostname/different-port redirect: Authorization NOT received by server B')
+    console.log('     authorization: (none) — origin-based check prevents the port-attack')
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Audit events summary (from real onAudit callbacks above)
+    // Defence 3b: same-origin redirect (same hostname AND port) keeps Authorization
+    //   127.0.0.1:4005 → 127.0.0.1:4005 (path only changes)
+    //   originOrigin = "http://127.0.0.1:4005"; redirectOrigin = "http://127.0.0.1:4005"
+    //   → same origin → Authorization kept (precision test)
     // ─────────────────────────────────────────────────────────────────────────
-    subheader('Audit events — real GuardAuditEvent objects (no secret values)')
+    subheader('Defence 3b — same-origin redirect keeps Authorization (precision)')
 
-    const d1Event = auditLog[0]
-    const d2aEvent = strictAudit[0]
+    // A single server on port 4012 handles both /v1 (redirect → /v2 same port)
+    // and /v2 (200 + record headers).  Origin stays "http://127.0.0.1:4012" throughout.
+    const receivedBySameOrigin: Record<string, string | string[] | undefined> = {}
+    const srvSameOriginBoth = createServer((req, res) => {
+        if (req.url === '/v1') {
+            res.writeHead(302, { location: 'http://127.0.0.1:4012/v2' })
+            res.end()
+        } else {
+            Object.assign(receivedBySameOrigin, req.headers)
+            res.writeHead(200)
+            res.end('same-origin-final')
+        }
+    })
+    await new Promise<void>((r) => srvSameOriginBoth.listen(4012, '127.0.0.1', r))
 
-    if (d1Event) {
-        console.log('  Defence 1 — allowed request:')
-        console.log('  ' + JSON.stringify(d1Event, null, 2).split('\n').join('\n  '))
-        console.log()
+    console.log()
+    console.log('  Same origin: http://127.0.0.1:4012/v1 → http://127.0.0.1:4012/v2')
+    console.log(`  Request headers: Authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)}`)
+    console.log()
+
+    await secureAxiosRequest({
+        url: 'http://127.0.0.1:4012/v1',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${FAKE_OPENAI_KEY}` }
+    })
+
+    const authSameOrigin = receivedBySameOrigin['authorization']
+    if (!authSameOrigin) {
+        fail('Defence 3b (same-origin) — Authorization was stripped unexpectedly')
     }
-    if (d2aEvent) {
-        console.log('  Defence 2a — blocked initial call:')
-        console.log('  ' + JSON.stringify(d2aEvent, null, 2).split('\n').join('\n  '))
-        console.log()
-    }
+    console.log('  ✅ Same-origin redirect: Authorization KEPT (correct — same origin)')
+    console.log(`     authorization: Bearer ${maskSecret(FAKE_OPENAI_KEY)} ✓`)
 
-    // Verify no secret value appears in any event
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audit events summary (Defence 2b only — one real event)
+    // ─────────────────────────────────────────────────────────────────────────
+    subheader('Audit event — real GuardAuditEvent (Defence 2b blocked redirect)')
+
+    // Verify no secret value appears in any audit event
     const allEvents = [...auditLog, ...strictAudit]
     const leaks = allEvents.filter((e) => JSON.stringify(e).includes(FAKE_OPENAI_KEY) || JSON.stringify(e).includes(FAKE_DB_PASS))
     if (leaks.length > 0) fail(`Audit events contain secret values (${leaks.length} event(s))`)

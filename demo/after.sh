@@ -3,6 +3,14 @@
 # Runs the AFTER demo — shows the Zero-Context Guard in action.
 # Usage from repo root:  bash demo/after.sh
 #
+# Defences shown:
+#   1  — $vars absent; resolved-secret redaction
+#   2a — allowedHosts blocks initial call to non-listed host
+#   2b — live redirect blocked at hop 1 (allowedHosts re-check)
+#   3  — cross-host redirect (localhost→127.0.0.1) strips Authorization
+#   3a — same-hostname/different-port redirect also strips (origin-based check)
+#   3b — same-origin redirect keeps Authorization (precision)
+#
 # Clean-exit guarantee:
 #   • SIGINT / SIGTERM / EXIT trap forwards the signal to ts-node and waits.
 #   • The TypeScript script itself has a 30 s hard timeout + closeAllServers().

@@ -129,8 +129,8 @@ describe('secureAxiosRequest — pinned-agent lookup with all:true (regression)'
             })
 
             expect(response.status).toBe(200)
-            // Authorization must be stripped because the redirect crosses hostnames
-            // (originHostname=localhost, redirectHostname=127.0.0.1)
+            // Authorization must be stripped because the redirect crosses origins:
+            // origin(localhost:portA) ≠ origin(127.0.0.1:portB) — both hostname and host differ
             expect(receivedByB['authorization']).toBeUndefined()
         } finally {
             await closeServer(serverA)
@@ -138,13 +138,17 @@ describe('secureAxiosRequest — pinned-agent lookup with all:true (regression)'
         }
     })
 
-    it('completes a same-host redirect (127.0.0.1:A → 127.0.0.1:B) and keeps Authorization', async () => {
+    it('strips Authorization on same-hostname but different-port redirect (127.0.0.1:A → 127.0.0.1:B)', async () => {
+        // Origin-based check: http://127.0.0.1:portA ≠ http://127.0.0.1:portB
+        // Even though hostname is the same, the port change means a different origin.
+        // This is the attack scenario: server A could redirect to server B on a different
+        // port controlled by an attacker, leaking the Authorization header.
         const receivedByB: Record<string, string | string[] | undefined> = {}
 
         const { server: serverB, port: portB } = await startServer((req, res) => {
             Object.assign(receivedByB, req.headers)
             res.writeHead(200)
-            res.end('same-host-collected')
+            res.end('diff-port-collected')
         })
 
         const { server: serverA, port: portA } = await startServer((_, res) => {
@@ -160,8 +164,8 @@ describe('secureAxiosRequest — pinned-agent lookup with all:true (regression)'
             })
 
             expect(response.status).toBe(200)
-            // Same origin hostname → Authorization must be kept
-            expect(receivedByB['authorization']).toBe('Bearer sk-FAKE-TOKEN-0000000000000000')
+            // Different port = different origin → Authorization MUST be stripped
+            expect(receivedByB['authorization']).toBeUndefined()
         } finally {
             await closeServer(serverA)
             await closeServer(serverB)

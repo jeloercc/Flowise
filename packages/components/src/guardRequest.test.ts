@@ -414,3 +414,65 @@ describe('makeSecureRequestHelper — onAudit callback', () => {
         expect(events[0]).not.toHaveProperty('secret')
     })
 })
+
+// ── Origin-based header stripping in guard redirect loop ─────────────────────
+
+describe('$secureRequest — origin-based header stripping (same hostname, different port)', () => {
+    /**
+     * 127.0.0.1:4001 → 127.0.0.1:4002
+     * Hostname unchanged, port changes → Authorization MUST be stripped.
+     * Previously only hostname was compared, so this was a bypass.
+     */
+    beforeEach(() => {
+        jest.resetAllMocks()
+        mockGetCred.mockResolvedValue({ token: 'tok-SAMEHOST-DIFFPORT-12345' })
+    })
+
+    it('strips Authorization when redirect changes port on the same hostname', async () => {
+        const portBinding: SecretBinding = {
+            name: 'porttest',
+            credentialId: 'cred-port',
+            allowedHosts: ['127.0.0.1']
+        }
+
+        mockSingleHop
+            .mockResolvedValueOnce({
+                status: 302,
+                headers: { location: 'http://127.0.0.1:4002/collect' },
+                data: ''
+            } as any)
+            .mockResolvedValueOnce({ status: 200, data: 'ok', headers: {} } as any)
+
+        const helper = makeSecureRequestHelper([portBinding], fakeOptions)!
+        await helper('porttest', 'http://127.0.0.1:4001/start', {})
+
+        expect(mockSingleHop).toHaveBeenCalledTimes(2)
+        const secondHop = mockSingleHop.mock.calls[1][0] as any
+        expect(secondHop.headers?.Authorization).toBeUndefined()
+        expect(secondHop.headers?.authorization).toBeUndefined()
+    })
+
+    it('keeps Authorization when redirect stays on the same origin (same host+port)', async () => {
+        const sameOriginBinding: SecretBinding = {
+            name: 'sameorigin',
+            credentialId: 'cred-same',
+            allowedHosts: ['127.0.0.1']
+        }
+
+        mockSingleHop
+            .mockResolvedValueOnce({
+                status: 302,
+                headers: { location: 'http://127.0.0.1:4001/v2' },
+                data: ''
+            } as any)
+            .mockResolvedValueOnce({ status: 200, data: 'ok', headers: {} } as any)
+
+        const helper = makeSecureRequestHelper([sameOriginBinding], fakeOptions)!
+        await helper('sameorigin', 'http://127.0.0.1:4001/v1', {})
+
+        expect(mockSingleHop).toHaveBeenCalledTimes(2)
+        const secondHop = mockSingleHop.mock.calls[1][0] as any
+        // Authorization must still be present
+        expect(secondHop.headers?.Authorization).toBeDefined()
+    })
+})

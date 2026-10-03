@@ -609,3 +609,107 @@ describe('secureFetch — redirect header handling', () => {
         expect(secondHeaders['Cookie'] ?? secondHeaders['cookie']).toBeUndefined()
     })
 })
+
+// ── Origin-based header stripping (scheme + hostname + port) ─────────────────
+// These tests document that stripping is triggered by ANY origin change:
+// different port on the same hostname, different hostname, or http→https.
+
+describe('secureAxiosRequest — origin-based header stripping (port change)', () => {
+    beforeEach(() => {
+        jest.clearAllMocks()
+        setupDns()
+    })
+
+    it('keeps Authorization on same-origin redirect (same scheme+host+port)', async () => {
+        // :8080 → :8080 — same origin, header must be kept
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'http://api.example.com:8080/v2' }))
+            .mockResolvedValueOnce(fakeResponse(200))
+
+        await secureAxiosRequest({
+            url: 'http://api.example.com:8080/v1',
+            method: 'GET',
+            headers: { Authorization: 'Bearer sameport-token-1234' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Authorization']).toBe('Bearer sameport-token-1234')
+    })
+
+    it('strips Authorization on same-hostname but different-port redirect', async () => {
+        // :4001 → :4002 — hostname unchanged, port changed — must strip
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(302, { location: 'http://api.example.com:4002/collect' }))
+            .mockResolvedValueOnce(fakeResponse(200))
+
+        await secureAxiosRequest({
+            url: 'http://api.example.com:4001/start',
+            method: 'GET',
+            headers: { Authorization: 'Bearer diffport-token-9999' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Authorization']).toBeUndefined()
+    })
+
+    it('strips Authorization on http → https redirect (scheme change)', async () => {
+        mockAxios
+            .mockResolvedValueOnce(fakeResponse(301, { location: 'https://api.example.com/v1' }))
+            .mockResolvedValueOnce(fakeResponse(200))
+
+        await secureAxiosRequest({
+            url: 'http://api.example.com/v1',
+            method: 'GET',
+            headers: { Authorization: 'Bearer scheme-change-token-9999' }
+        })
+
+        const secondCall = mockAxios.mock.calls[1][0]
+        expect(secondCall.headers['Authorization']).toBeUndefined()
+    })
+})
+
+describe('secureFetch — origin-based header stripping (port change)', () => {
+    beforeEach(() => {
+        jest.clearAllMocks()
+        setupDns()
+    })
+
+    function fetchResponse2(status: number, headers: Record<string, string> = {}, body = 'ok') {
+        return {
+            status,
+            ok: status >= 200 && status < 300,
+            headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+            text: async () => body
+        }
+    }
+
+    it('strips Authorization on same-hostname but different-port redirect', async () => {
+        mockFetch
+            .mockResolvedValueOnce(fetchResponse2(302, { location: 'http://api.example.com:4002/collect' }) as any)
+            .mockResolvedValueOnce(fetchResponse2(200) as any)
+
+        await secureFetch('http://api.example.com:4001/start', {
+            headers: { Authorization: 'Bearer diffport-fetch-9999' }
+        })
+
+        const secondCall = mockFetch.mock.calls[1]
+        const secondHeaders: any = secondCall[1]?.headers ?? {}
+        const authValue = typeof secondHeaders === 'object' ? secondHeaders['Authorization'] ?? secondHeaders['authorization'] : undefined
+        expect(authValue).toBeUndefined()
+    })
+
+    it('strips Authorization on http → https redirect (scheme change)', async () => {
+        mockFetch
+            .mockResolvedValueOnce(fetchResponse2(301, { location: 'https://api.example.com/v1' }) as any)
+            .mockResolvedValueOnce(fetchResponse2(200) as any)
+
+        await secureFetch('http://api.example.com/v1', {
+            headers: { Authorization: 'Bearer scheme-fetch-9999' }
+        })
+
+        const secondCall = mockFetch.mock.calls[1]
+        const secondHeaders: any = secondCall[1]?.headers ?? {}
+        const authValue = typeof secondHeaders === 'object' ? secondHeaders['Authorization'] ?? secondHeaders['authorization'] : undefined
+        expect(authValue).toBeUndefined()
+    })
+})
