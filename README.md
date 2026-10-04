@@ -2,15 +2,13 @@
 
 ## IBM Bob Hackathon 2025 — Theme 2: Modernize What Matters
 
-> Flowise is end-of-life and ships critical vulnerabilities: every Custom Tool
-> executed by an LLM receives raw `$vars` — workspace secrets and API keys — in plain
-> text. One prompt injection exfiltrates them. We added a **Zero-Context Guard**:
-> credentials resolve server-side, reaching the sandbox only through `$secureRequest`,
-> a host-allowlisted proxy. Resolved values and static token patterns are redacted from
-> outputs and errors before reaching the LLM. Redirect safety: Authorization is stripped
-> on cross-host hops. DNS-rebinding protection: the validated IP is pinned into the
-> connection. Result: 10 audit findings addressed, 71 new tests, zero breaking changes,
-> no new dependencies.
+> Flowise is end-of-life, and its Custom Tools receive every workspace variable,
+> including API keys, as plain text; a prompt injection can exfiltrate them. Using
+> IBM Bob we audited it (10 findings) and built a Zero-Context Guard: tools call
+> `$secureRequest` with a secret name, the backend injects the credential only for
+> allow-listed hosts, and real secret values are redacted from outputs and errors.
+> Cross-origin redirects strip credentials; DNS rebinding is mitigated. 71 new tests,
+> 981 passing, no new dependencies. Limits are documented.
 
 ---
 
@@ -23,8 +21,7 @@ variable, including **runtime variables resolved from `process.env`**. The LLM c
 which tool to call and what arguments to pass; prompt injection via tool arguments is
 a realistic, low-effort attack.
 
-This creates a confirmed path to [OWASP LLM02 — Insecure Output Handling][llm02]
-and [LLM06 — Sensitive Information Disclosure][llm06]:
+This creates a confirmed path to [OWASP LLM02:2025 — Sensitive Information Disclosure][llm02]:
 
 | Attack                   | One-line repro                                                                                      | Audit finding |
 | ------------------------ | --------------------------------------------------------------------------------------------------- | ------------- |
@@ -39,8 +36,7 @@ An IBM Bob Secret Leak Audit ([`docs/AUDIT.md`](docs/AUDIT.md)) traced **10 conf
 findings** across 4 sinks, all with file:line citations and minimal reproductions. See that
 document for the full table.
 
-[llm02]: https://owasp.org/www-project-top-10-for-large-language-model-applications/
-[llm06]: https://owasp.org/www-project-top-10-for-large-language-model-applications/
+[llm02]: https://genai.owasp.org/llmrisk/llm022025-sensitive-information-disclosure/
 
 ---
 
@@ -169,7 +165,9 @@ Fix: [`httpSecurity.ts`](packages/components/src/httpSecurity.ts) — `createPin
 
 ### What did not change
 
--   Any Custom Tool with **no** `secretBindings` field behaves identically to before.
+-   Any Custom Tool with **no** `secretBindings` field behaves identically to before,
+    except that secret-named runtime variables (matching 14 key patterns: `SECRET`, `KEY`,
+    `TOKEN`, `PASSWORD`, `FLOWISE_`, etc.) are now filtered out of `$vars` globally (F-03).
 -   All 910 pre-existing tests pass without modification.
 -   Zero new runtime npm dependencies.
 -   All node types other than `CustomTool` are unmodified.

@@ -2,17 +2,15 @@
 
 ## 1. Project Description (≤100-word submission field)
 
-> Flowise is end-of-life and ships critical vulnerabilities: every Custom Tool
-> executed by an LLM receives raw `$vars` — workspace secrets and API keys — in plain
-> text. One prompt injection exfiltrates them. We added a **Zero-Context Guard**:
-> credentials resolve server-side, reaching the sandbox only through `$secureRequest`,
-> a host-allowlisted proxy. Resolved values and static token patterns are redacted from
-> outputs and errors before reaching the LLM. Redirect safety: Authorization is stripped
-> on cross-host hops. DNS-rebinding protection: the validated IP is pinned into the
-> connection. Result: 10 audit findings addressed, 71 new tests, zero breaking changes,
-> no new dependencies.
+> Flowise is end-of-life, and its Custom Tools receive every workspace variable,
+> including API keys, as plain text; a prompt injection can exfiltrate them. Using
+> IBM Bob we audited it (10 findings) and built a Zero-Context Guard: tools call
+> `$secureRequest` with a secret name, the backend injects the credential only for
+> allow-listed hosts, and real secret values are redacted from outputs and errors.
+> Cross-origin redirects strip credentials; DNS rebinding is mitigated. 71 new tests,
+> 981 passing, no new dependencies. Limits are documented.
 
-**Word count: 97** ✓ (limit is 100; verified with `wc -w`)
+**Word count: 81** ✓ (limit is 100; verified by stripping blockquote markers and backticks, then `wc -w`)
 
 ---
 
@@ -25,8 +23,7 @@ variable, including **runtime variables resolved from `process.env`**. The LLM c
 which tool to call and what arguments to pass; it can also inject adversarial content via
 tool arguments.
 
-This creates a direct, confirmed path to [OWASP LLM02 — Insecure Output Handling][llm02]
-and [LLM06 — Sensitive Information Disclosure][llm06]:
+This creates a direct, confirmed path to [OWASP LLM02:2025 — Sensitive Information Disclosure][llm02]:
 
 | Attack                   | One-line repro                                                                                                                          |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -42,8 +39,7 @@ across 4 sinks: LLM context (S1), tool output to LLM (S2), error messages (S3), 
 callbacks/traces/logs (S4). All 10 are evidence-backed with file:line citations and
 minimal reproductions.
 
-[llm02]: https://owasp.org/www-project-top-10-for-large-language-model-applications/
-[llm06]: https://owasp.org/www-project-top-10-for-large-language-model-applications/
+[llm02]: https://genai.owasp.org/llmrisk/llm022025-sensitive-information-disclosure/
 
 ---
 
@@ -161,7 +157,9 @@ with real TCP servers ([`httpSecurity.pinnedAgent.test.ts`](../packages/componen
 
 ### What did not change
 
--   Any Custom Tool with **no** `secretBindings` field behaves identically to before.
+-   Any Custom Tool with **no** `secretBindings` field behaves identically to before,
+    except that secret-named runtime variables (matching 14 key patterns: `SECRET`, `KEY`,
+    `TOKEN`, `PASSWORD`, `FLOWISE_`, etc.) are now filtered out of `$vars` globally (F-03).
 -   All 910 pre-existing tests pass without modification.
 -   Zero new runtime npm dependencies added.
 -   The SSRF deny list, NodeVM `axios`/`node-fetch` wrappers, and `secureAxiosRequest`
