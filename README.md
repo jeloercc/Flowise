@@ -9,7 +9,7 @@
 > a host-allowlisted proxy. Resolved values and static token patterns are redacted from
 > outputs and errors before reaching the LLM. Redirect safety: Authorization is stripped
 > on cross-host hops. DNS-rebinding protection: the validated IP is pinned into the
-> connection. Result: 10 audit findings addressed, 64 new tests, zero breaking changes,
+> connection. Result: 10 audit findings addressed, 71 new tests, zero breaking changes,
 > no new dependencies.
 
 ---
@@ -143,23 +143,23 @@ already replaced the token with `[REDACTED]`.
 
 ## Improvements Made
 
-| #   | Area                                                       | Before                                                              | After                                                                                                       | Finding    | Status                                |
-| --- | ---------------------------------------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------- |
-| 1   | Sandbox scope (Custom Tool)                                | `$vars` with all secrets in NodeVM scope                            | `$vars` absent when `secretBindings` declared; `$secureRequest` injected                                    | F-02       | ✅ Closed (requires secretBindings)   |
-| 2   | E2B remote VM                                              | Full `$vars` serialised and sent to e2b.dev                         | E2B disabled for tools with secret bindings                                                                 | F-01       | ✅ Closed (requires secretBindings)   |
-| 3   | SSRF in E2B sandbox                                        | No deny-list; sandbox used native `fetch` freely                    | E2B blocked; only `secureAxiosSingleHop` path available for binding tools                                   | F-05       | ✅ Closed (requires secretBindings)   |
-| 4   | Runtime env vars in `$vars`                                | Any `process.env` key reachable via `runtime` variable              | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `FLOWISE_`, etc. globally                              | F-03       | ✅ Closed (global)                    |
-| 5   | Tool output to LLM (binding tools)                         | Raw output returned as ToolMessage                                  | `redact(result, resolvedSecretValues)` in `_call()` — both static patterns and resolved values              | F-04       | ✅ Closed (requires secretBindings)   |
-| 6   | Error messages (binding tools)                             | Execution error could embed raw secret values                       | `redact(error, resolvedSecretValues)` before re-throw — both static patterns and resolved values            | F-06       | ✅ Closed (requires secretBindings)   |
-| 7   | SSE `agent_trace` stream                                   | Raw output emitted verbatim                                         | `redact(output, [])` in `handleToolEnd` / `handleToolError` — static patterns only                          | F-04, F-06 | ⚠️ Partial (static patterns only)     |
-| 8   | Server logs at verbose level                               | Raw output at `logger.verbose` when `DEBUG=true`                    | `redact(output, [])` in `onToolEnd` / `onToolError` — static patterns only                                  | F-08       | ⚠️ Partial (static patterns only)     |
-| 9   | Outbound HTTP auth (Custom Tool)                           | Sandbox received raw token values; injected them in `fetch` headers | Auth header injected by host process; sandbox never receives token                                          | F-05       | ✅ Closed (requires secretBindings)   |
-| 10  | Redirect cross-host credential forwarding                  | Authorization/Cookie forwarded on any redirect, even cross-origin   | Sensitive headers stripped when redirect changes hostname; `allowedHosts` re-checked per hop                | (new)      | ✅ Closed                             |
-| 11  | DNS-rebinding TOCTOU window                                | `checkDenyList` + `axios` resolved hostname twice; IP could change  | `secureAxiosSingleHop` pins validated IP into `http.Agent`; DNS resolved once per hop                       | (new)      | ✅ Closed                             |
-| 12  | Resolved-secret redaction                                  | `redact()` called with `[]`; custom secrets not caught              | `onSecretResolved` callback populates `resolvedSecretValues`; real values passed to `redact()`              | F-04, F-06 | ✅ Closed (requires secretBindings)   |
-| 13  | Tracing providers (all 7 listed)                           | Received full unredacted output via LangChain callback chain        | Protected by static-pattern redaction in `_call()` only; no per-provider wrapper; custom secrets still leak | F-10       | ⚠️ Not closed — see Known Limitations |
-| 14  | `$vars` in LLMNode / ConditionAgent / Condition / ToolNode | `$vars` with sensitive runtime vars in scope                        | Worst-case names blocked by denylist; full `$vars` removal deferred                                         | F-07       | ⚠️ Partial (denylist only)            |
-| 15  | `$vars` in ChatPromptTemplate                              | `$vars` in scope; sensitive key names reachable                     | Worst-case names blocked by denylist; full removal deferred                                                 | F-09       | ⚠️ Partial (denylist only)            |
+| #   | Area                                                       | Before                                                              | After                                                                                                                      | Finding    | Status                                |
+| --- | ---------------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------- |
+| 1   | Sandbox scope (Custom Tool)                                | `$vars` with all secrets in NodeVM scope                            | `$vars` absent when `secretBindings` declared; `$secureRequest` injected                                                   | F-02       | ✅ Closed (requires secretBindings)   |
+| 2   | E2B remote VM                                              | Full `$vars` serialised and sent to e2b.dev                         | E2B disabled for tools with secret bindings                                                                                | F-01       | ✅ Closed (requires secretBindings)   |
+| 3   | SSRF in E2B sandbox                                        | No deny-list; sandbox used native `fetch` freely                    | E2B blocked; only `secureAxiosSingleHop` path available for binding tools                                                  | F-05       | ✅ Closed (requires secretBindings)   |
+| 4   | Runtime env vars in `$vars`                                | Any `process.env` key reachable via `runtime` variable              | 14-pattern denylist blocks `SECRET`, `KEY`, `TOKEN`, `FLOWISE_`, etc. globally                                             | F-03       | ✅ Closed (global)                    |
+| 5   | Tool output to LLM (binding tools)                         | Raw output returned as ToolMessage                                  | `redact(result, resolvedSecretValues)` in `_call()` — both static patterns and resolved values                             | F-04       | ✅ Closed (requires secretBindings)   |
+| 6   | Error messages (binding tools)                             | Execution error could embed raw secret values                       | `redact(error, resolvedSecretValues)` before re-throw — both static patterns and resolved values                           | F-06       | ✅ Closed (requires secretBindings)   |
+| 7   | SSE `agent_trace` stream                                   | Raw output emitted verbatim                                         | `redact(output, [])` in `handleToolEnd` / `handleToolError` — static patterns only                                         | F-04, F-06 | ⚠️ Partial (static patterns only)     |
+| 8   | Server logs at verbose level                               | Raw output at `logger.verbose` when `DEBUG=true`                    | `redact(output, [])` in `onToolEnd` / `onToolError` — static patterns only                                                 | F-08       | ⚠️ Partial (static patterns only)     |
+| 9   | Outbound HTTP auth (Custom Tool)                           | Sandbox received raw token values; injected them in `fetch` headers | Auth header injected by host process; sandbox never receives token                                                         | F-05       | ✅ Closed (requires secretBindings)   |
+| 10  | Redirect cross-origin credential forwarding                | Authorization/Cookie forwarded on any redirect, even cross-origin   | Sensitive headers stripped when redirect changes **full origin (scheme+hostname+port)**; `allowedHosts` re-checked per hop | (new)      | ✅ Closed                             |
+| 11  | DNS-rebinding TOCTOU window                                | `checkDenyList` + `axios` resolved hostname twice; IP could change  | `secureAxiosSingleHop` pins validated IP into `http.Agent`; DNS resolved once per hop                                      | (new)      | ✅ Closed                             |
+| 12  | Resolved-secret redaction                                  | `redact()` called with `[]`; custom secrets not caught              | `onSecretResolved` callback populates `resolvedSecretValues`; real values passed to `redact()`                             | F-04, F-06 | ✅ Closed (requires secretBindings)   |
+| 13  | Tracing providers (all 7 listed)                           | Received full unredacted output via LangChain callback chain        | Protected by static-pattern redaction in `_call()` only; no per-provider wrapper; custom secrets still leak                | F-10       | ⚠️ Not closed — see Known Limitations |
+| 14  | `$vars` in LLMNode / ConditionAgent / Condition / ToolNode | `$vars` with sensitive runtime vars in scope                        | Worst-case names blocked by denylist; full `$vars` removal deferred                                                        | F-07       | ⚠️ Partial (denylist only)            |
+| 15  | `$vars` in ChatPromptTemplate                              | `$vars` in scope; sensitive key names reachable                     | Worst-case names blocked by denylist; full removal deferred                                                                | F-09       | ⚠️ Partial (denylist only)            |
 
 ### Upstream bug fixed
 
@@ -195,17 +195,22 @@ The following gaps are documented honestly. They are deferred to a future iterat
 No server, no credentials, no setup — just Node ≥ 20 and a cloned repo.
 
 ```bash
-# Show the unguarded attack: $vars exfiltration + Authorization forwarded on redirect
+# Show attacks using ORIGINAL upstream Flowise code (commit 9291856d snapshot):
+#   Attack 1: $vars exfiltration — LLM receives all workspace secrets
+#   Attack 2: Authorization forwarded on same-hostname/different-port redirect
+#             (upstream has NO cross-origin header-stripping logic)
 bash demo/before.sh
 # Expected: runs in < 40 s; prints ⚠️ for each demonstrated leak; exits 0
 
-# Show all four defences live against real TCP servers
+# Show all defences live against real TCP servers (our fixed code)
 bash demo/after.sh
 # Expected: runs in < 40 s; prints ✅ for each defence; exits 0
-#   Defence 1: $vars absent; resolved values redacted from output
+#   Defence 1:  $vars absent; resolved values redacted from output
 #   Defence 2a: allowedHosts blocks initial call to non-allowed host
 #   Defence 2b: live redirect (localhost:4001 → 127.0.0.1:4002) blocked at hop 1
-#   Defence 3: cross-host redirect strips Authorization; same-host keeps it
+#   Defence 3a: same-hostname/different-port redirect strips Authorization
+#               (same request as before.sh Attack 2 — now fixed by origin-based check)
+#   Defence 3b: same-origin redirect keeps Authorization (precision)
 ```
 
 Both scripts set `HTTP_SECURITY_CHECK=false` internally (loopback allowed inside the demo
@@ -249,12 +254,12 @@ implementation began.
 Bob implemented the guard test-first, running `jest` after every subtask:
 
 1. **`src/guardRedact.ts`** — 20 tests written first. Real bug found and fixed mid-cycle: a negative lookahead was needed to prevent the Bearer pattern from re-matching `Bearer [REDACTED]` after a resolved-secret pass.
-2. **`src/guardRequest.ts`** — 13 initial tests. Additional tests added after self-review: redirect re-check, cross-host header stripping, `onSecretResolved`, `onAudit` callbacks. Final count: 25 tests.
+2. **`src/guardRequest.ts`** — 13 initial tests. Additional tests added after self-review: redirect re-check, cross-host header stripping, `onSecretResolved`, `onAudit` callbacks, origin-based stripping. Final count: 27 tests.
 3. **`src/utils.ts`** — `BLOCKED_ENV_KEY_PATTERNS`, `secureRequestHelper` param, `disableE2B` flag.
 4. **`core.ts` + `CustomTool.ts`** — `secretBindings`, `setSecretBindings()`, `setExecutionOptions()`, wiring, `redact()` on outputs and errors. 6 new tests in `core.test.ts`.
 5. **`handler.ts`** — `redact()` in all four callback methods.
-6. **`httpSecurity.ts`** — cross-host redirect strips Authorization/Cookie; `secureAxiosSingleHop` closes DNS-rebinding TOCTOU window; upstream `createPinnedAgent` lookup bug fixed. 9 new tests in `httpSecurity.test.ts`, 4 in `httpSecurity.pinnedAgent.test.ts`.
-7. Full suite: **974 tests, 0 failures, 24 suites** (baseline: 910 tests, 20 suites). Pre-commit hooks (prettier, eslint, lint-staged) pass automatically.
+6. **`httpSecurity.ts`** — cross-origin redirect strips Authorization/Cookie using `urlOrigin()` (scheme+host+port); `secureAxiosSingleHop` closes DNS-rebinding TOCTOU window; upstream `createPinnedAgent` lookup bug fixed. 14 new tests in `httpSecurity.test.ts`, 4 in `httpSecurity.pinnedAgent.test.ts`.
+7. Full suite: **981 tests, 0 failures, 24 suites** (baseline: 910 tests, 20 suites). Pre-commit hooks (prettier, eslint, lint-staged) pass automatically.
 
 ### Measurable Bob contribution
 
@@ -283,10 +288,10 @@ packages/components/
     guardRedact.ts               ← NEW: pure redact() function (static patterns + resolved secrets)
     guardRedact.test.ts          ← NEW: 20 tests
     guardRequest.ts              ← NEW: makeSecureRequestHelper factory + redirect loop + audit events
-    guardRequest.test.ts         ← NEW: 25 tests (redirect, header-strip, onSecretResolved, onAudit)
-    httpSecurity.ts              ← MODIFIED: secureAxiosSingleHop (DNS-pin); cross-host strip;
+    guardRequest.test.ts         ← NEW: 27 tests (redirect, header-strip, onSecretResolved, onAudit, origin-based)
+    httpSecurity.ts              ← MODIFIED: secureAxiosSingleHop (DNS-pin); urlOrigin() cross-origin strip;
                                               createPinnedAgent lookup all:true fix
-    httpSecurity.test.ts         ← MODIFIED: +9 redirect header-stripping tests
+    httpSecurity.test.ts         ← MODIFIED: +14 redirect/origin-based header-stripping tests
     httpSecurity.pinnedAgent.test.ts ← NEW: 4 integration tests (real TCP servers)
     utils.ts                     ← MODIFIED: BLOCKED_ENV_KEY_PATTERNS, secureRequestHelper param,
                                               disableE2B flag
@@ -306,9 +311,11 @@ docs/
   FLOWISE_README.md              ← original Flowise README (preserved)
 
 demo/
-  before.sh / run-before.ts      ← unguarded attack demo (< 40 s, exits clean)
-  after.sh  / run-after.ts       ← guarded defence demo (< 40 s, exits clean)
+  before.sh / run-before.ts      ← BEFORE demo: runs upstream Flowise snapshot (commit 9291856d)
+  after.sh  / run-after.ts       ← AFTER demo: guarded defence (real TCP servers; < 40 s, exits clean)
   mock-servers.js                ← two-server redirect harness
+  legacy/
+    httpSecurity.upstream.ts     ← verbatim upstream httpSecurity.ts at 9291856d (Apache-2.0)
 ```
 
 ## Running the Tests
@@ -316,7 +323,7 @@ demo/
 ```bash
 pnpm install
 pnpm --filter flowise-components exec jest --ci --forceExit --silent
-# Expected: Test Suites: 24 passed  Tests: 974 passed  Time: ~120 s
+# Expected: Test Suites: 24 passed  Tests: 981 passed  Time: ~120 s
 ```
 
 ---
